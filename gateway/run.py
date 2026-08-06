@@ -14350,6 +14350,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "profile":
             return await self._handle_profile_command(event)
 
+        if canonical == "aiuse":
+            return await self._handle_aiuse_command(event)
+
         if canonical == "whoami":
             return await self._handle_whoami_command(event)
 

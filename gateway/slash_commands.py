@@ -23,7 +23,9 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import sys
+import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
@@ -377,6 +379,44 @@ class GatewaySlashCommandsMixin:
         ]
 
         return "\n".join(lines)
+
+    async def _handle_aiuse_command(self, event: MessageEvent) -> str:
+        """Run the deterministic aiuse chat report without invoking the LLM."""
+        args = event.get_command_args().strip()
+        if args:
+            return "Usage: /aiuse"
+
+        executable = shutil.which("aiuse")
+        if not executable:
+            return "⚠️ `aiuse` is not available on the Hermes gateway PATH."
+
+        def _run_aiuse() -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [executable, "--for-chat", "-q"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=180,
+            )
+
+        try:
+            result = await asyncio.to_thread(_run_aiuse)
+        except subprocess.TimeoutExpired:
+            return "⚠️ `aiuse --for-chat -q` timed out after 180 seconds."
+        except OSError as exc:
+            logger.warning("/aiuse failed to start: %s", exc)
+            return "⚠️ Could not start `aiuse --for-chat -q`."
+
+        report = (result.stdout or "").strip()
+        # aiuse uses exit code 2 for a valid report containing active alerts.
+        if result.returncode in (0, 2) and report:
+            return report
+
+        diagnostic = (result.stderr or "").strip()
+        if diagnostic:
+            logger.warning("/aiuse exited %s: %s", result.returncode, diagnostic[-500:])
+        return "⚠️ `aiuse --for-chat -q` did not produce a report."
 
     async def _handle_whoami_command(self, event: MessageEvent) -> str:
         """Handle /whoami — show the user's slash command access on this scope.
