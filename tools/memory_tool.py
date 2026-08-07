@@ -25,6 +25,7 @@ Design:
 
 import json
 import logging
+import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -387,6 +388,64 @@ class MemoryStore:
             return self.user_char_limit
         return self.memory_char_limit
 
+    def _queue_pending_operation(
+        self,
+        target: str,
+        operations: List[Dict[str, Any]],
+        *,
+        current: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Durably queue a valid write that cannot fit in the bounded store.
+
+        The bounded always-loaded store must not silently evict data, but a
+        rejected memory write must not disappear either.  Store the already
+        threat-scanned operation in a mode-0600 JSON journal for the curator
+        to review and merge later.  This is deliberately not auto-applied:
+        choosing which existing fact to remove or rewrite is semantic work.
+        """
+        pending_dir = get_memory_dir() / "pending"
+        pending_dir.mkdir(parents=True, exist_ok=True)
+        pending_dir.chmod(0o700)
+        payload = {
+            "schema": 1,
+            "queued_at": time.time(),
+            "target": target,
+            "operations": operations,
+            "usage": {
+                "current": self._char_count(target) if current is None else current,
+                "limit": self._char_limit(target) if limit is None else limit,
+            },
+        }
+        filename = f"queued-{time.time_ns()}-{os.getpid()}.json"
+        path = pending_dir / filename
+        # O_EXCL prevents two sessions with the same clock resolution from
+        # overwriting one another's pending write.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+        except Exception:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            raise
+        return {
+            "success": True,
+            "done": True,
+            "queued": True,
+            "target": target,
+            "pending_path": str(path),
+            "usage": f"{payload['usage']['current']:,}/{payload['usage']['limit']:,}",
+            "message": (
+                "Memory is full, so the requested write was durably queued for "
+                "curator review; existing memory was not changed."
+            ),
+            "note": "Queued memory is durable but not yet in the always-loaded prompt.",
+        }
+
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()
@@ -427,18 +486,12 @@ class MemoryStore:
 
             if new_total > limit:
                 current = self._char_count(target)
-                return self._consolidation_failure({
-                    "success": False,
-                    "error": (
-                        f"Memory at {current:,}/{limit:,} chars. "
-                        f"Adding this entry ({len(content)} chars) would exceed the limit. "
-                        f"Consolidate now: use 'replace' to merge overlapping entries into "
-                        f"shorter ones or 'remove' stale or less important entries (see "
-                        f"current_entries below), then retry this add — all in this turn."
-                    ),
-                    "current_entries": entries,
-                    "usage": f"{current:,}/{limit:,}",
-                })
+                return self._queue_pending_operation(
+                    target,
+                    [{"action": "add", "content": content}],
+                    current=current,
+                    limit=limit,
+                )
 
             entries.append(content)
             self._set_entries(target, entries)
@@ -499,17 +552,12 @@ class MemoryStore:
 
             if new_total > limit:
                 current = self._char_count(target)
-                return self._consolidation_failure({
-                    "success": False,
-                    "error": (
-                        f"Replacement would put memory at {new_total:,}/{limit:,} chars. "
-                        f"Shorten the new content, or 'remove' other stale or less important "
-                        f"entries to make room (see current_entries below), then retry — all "
-                        f"in this turn."
-                    ),
-                    "current_entries": entries,
-                    "usage": f"{current:,}/{limit:,}",
-                })
+                return self._queue_pending_operation(
+                    target,
+                    [{"action": "replace", "old_text": old_text, "content": new_content}],
+                    current=current,
+                    limit=limit,
+                )
 
             entries[idx] = new_content
             self._set_entries(target, entries)
@@ -651,16 +699,12 @@ class MemoryStore:
             new_total = len(ENTRY_DELIMITER.join(working)) if working else 0
             if new_total > limit:
                 current = self._char_count(target)
-                return self._consolidation_failure({
-                    "success": False,
-                    "error": (
-                        f"After applying all {len(operations)} operations, memory would be at "
-                        f"{new_total:,}/{limit:,} chars -- over the limit. Remove or shorten more "
-                        f"entries in the same batch (see current_entries below), then retry."
-                    ),
-                    "current_entries": self._entries_for(target),
-                    "usage": f"{current:,}/{limit:,}",
-                })
+                return self._queue_pending_operation(
+                    target,
+                    operations,
+                    current=current,
+                    limit=limit,
+                )
 
             # Commit.
             self._set_entries(target, working)
@@ -726,6 +770,11 @@ class MemoryStore:
         if message:
             resp["message"] = message
         resp["note"] = "Write saved. This update is complete — do not repeat it."
+        if pct >= 70:
+            resp["warning"] = (
+                f"Memory is at {pct}% of its configured limit. Consolidate now "
+                "before attempting another add."
+            )
         return resp
 
     def _render_block(self, target: str, entries: List[str]) -> str:

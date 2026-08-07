@@ -21,12 +21,12 @@ Both are stored in `~/.hermes/memories/` and are injected into the system prompt
 
 :::info
 Character limits keep memory focused. Memory does **not** auto-compact: when a
-write would exceed the limit, the `memory` tool returns an error instead of
-silently dropping entries. The agent then makes room itself — consolidating or
-removing entries in the same turn before retrying (see [What Happens When Memory
-is Full](#what-happens-when-memory-is-full)). Note that `replace` is also bound
-by the limit: swapping an entry for a longer one can still overflow, so the new
-content must be shortened (or another entry removed) to fit.
+write would exceed the limit, the `memory` tool durably queues the already-scanned
+operation in `memories/pending/` instead of silently dropping it or evicting
+entries. The curator reviews that queue and merges safe operations later. The
+agent can still consolidate proactively, but a full-store write is no longer
+lost. Note that `replace` is also bound by the limit: swapping an entry for a
+longer one may be queued rather than applied immediately.
 :::
 
 ## How Memory Appears in the System Prompt
@@ -129,24 +129,29 @@ Memory has strict character limits to keep system prompts bounded:
 
 ### What Happens When Memory is Full
 
-When you try to add an entry that would exceed the limit, the tool returns an error:
+When a write would exceed the limit, the already-scanned operation is durably
+queued under `~/.hermes/memories/pending/` and the bounded store is left
+unchanged:
 
 ```json
 {
-  "success": false,
-  "error": "Memory at 2,100/2,200 chars. Adding this entry (250 chars) would exceed the limit. Consolidate now: use 'replace' to merge overlapping entries into shorter ones or 'remove' stale or less important entries (see current_entries below), then retry this add — all in this turn.",
-  "current_entries": ["..."],
-  "usage": "2,100/2,200"
+  "success": true,
+  "done": true,
+  "queued": true,
+  "pending_path": "~/.hermes/memories/pending/queued-....json",
+  "message": "Memory is full, so the requested write was durably queued for curator review; existing memory was not changed."
 }
 ```
 
-The agent should then:
-1. Read the current entries (shown in the error response)
-2. Identify entries that can be removed or consolidated
-3. Use `replace` to merge related entries into shorter versions
-4. Then `add` the new entry
+The daily curator reads pending operations, consolidates or rewrites them into
+the bounded stores when safe, and removes each queue file only after successful
+incorporation. A queued item is durable but is not visible in the always-loaded
+system-prompt snapshot until it is incorporated and a new session starts.
 
-**Best practice:** When memory is above 80% capacity (visible in the system prompt header), consolidate entries before adding new ones. For example, merge three separate "project uses X" entries into one comprehensive project description entry.
+**Best practice:** When memory is above 70% capacity (visible in the system
+prompt header), consolidate entries before adding new ones. The queue is a
+loss-prevention fallback, not permission to let the bounded store grow without
+review.
 
 ### Practical Examples of Good Memory Entries
 
