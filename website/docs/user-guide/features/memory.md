@@ -22,11 +22,7 @@ Both are stored in `~/.hermes/memories/` and are injected into the system prompt
 :::info
 Character limits keep memory focused. Memory does **not** auto-compact: when a
 write would exceed the limit, the `memory` tool durably queues the already-scanned
-operation in `memories/pending/` instead of silently dropping it or evicting
-entries. The curator reviews that queue and merges safe operations later. The
-agent can still consolidate proactively, but a full-store write is no longer
-lost. Note that `replace` is also bound by the limit: swapping an entry for a
-longer one may be queued rather than applied immediately.
+operation in the shared SQLite pending-operation journal (`~/.hermes/memory_pending.db`) instead of silently dropping it or evicting entries. The curator reviews that journal and merges safe operations later. The agent can still consolidate proactively, but a full-store write is no longer lost. Note that `replace` is also bound by the limit: swapping an entry for a longer one may be queued rather than applied immediately.
 :::
 
 ## How Memory Appears in the System Prompt
@@ -130,22 +126,23 @@ Memory has strict character limits to keep system prompts bounded:
 ### What Happens When Memory is Full
 
 When a write would exceed the limit, the already-scanned operation is durably
-queued under `~/.hermes/memories/pending/` and the bounded store is left
-unchanged:
+queued in the shared SQLite journal at `~/.hermes/memory_pending.db` and the
+bounded store is left unchanged:
 
 ```json
 {
   "success": true,
   "done": true,
+  "durable": true,
   "queued": true,
-  "pending_path": "~/.hermes/memories/pending/queued-....json",
-  "message": "Memory is full, so the requested write was durably queued for curator review; existing memory was not changed."
+  "active_in_prompt": false,
+  "pending_id": "...",
+  "message": "Memory is full; the write was durably queued for curator review."
 }
 ```
 
-The daily curator reads pending operations, consolidates or rewrites them into
-the bounded stores when safe, and removes each queue file only after successful
-incorporation. A queued item is durable but is not visible in the always-loaded
+The `/memory pending` review path lists both approval-gated and overflow
+operations. A queued item is durable but is not visible in the always-loaded
 system-prompt snapshot until it is incorporated and a new session starts.
 
 **Best practice:** When memory is above 70% capacity (visible in the system

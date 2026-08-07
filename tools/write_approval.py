@@ -129,6 +129,57 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
     logs and still returns a record (the write is simply lost, which is the
     safe failure for an approval gate — nothing is silently committed).
     """
+    if subsystem == MEMORY:
+        # Memory approval records share the crash-safe SQLite operation log with
+        # overflow writes. Skills retain their separate large-file review store.
+        from tools import memory_pending_queue as pq
+        action = str(payload.get("action", ""))
+        target = str(payload.get("target", "memory"))
+        expected_previous_hash = None
+        if action in {"replace", "remove", "batch"}:
+            try:
+                from tools.memory_tool import ENTRY_DELIMITER, MemoryStore
+                from tools import memory_pending_queue as pq
+                staged_store = MemoryStore()
+                staged_store.load_from_disk()
+                expected_previous_hash = pq.content_snapshot_hash(
+                    ENTRY_DELIMITER.join(staged_store._entries_for(target))
+                )
+                payload["expected_previous_hash"] = expected_previous_hash
+            except Exception as e:
+                logger.warning("Could not snapshot staged memory target: %s", e)
+        try:
+            rec = pq.enqueue(
+                pq.KIND_APPROVAL,
+                action,
+                target,
+                payload,
+                summary=summary,
+                origin=origin,
+                expected_previous_hash=expected_previous_hash,
+            )
+        except Exception as e:
+            logger.error("Failed to stage pending memory write: %s", e, exc_info=True)
+            return {
+                "id": "",
+                "subsystem": subsystem,
+                "action": action,
+                "summary": summary,
+                "origin": origin,
+                "created_at": time.time(),
+                "payload": payload,
+                "staging_error": str(e),
+            }
+        return {
+            "id": rec["id"],
+            "subsystem": subsystem,
+            "action": action,
+            "summary": rec["summary"],
+            "origin": rec["origin"],
+            "created_at": rec["created_at"],
+            "payload": payload,
+        }
+
     pid = uuid.uuid4().hex[:8]
     record = {
         "id": pid,
@@ -151,8 +202,27 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
     return record
 
 
+def _memory_pending_record(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Adapt a shared queue row to the approval-review record shape."""
+    return {
+        "id": rec["id"],
+        "subsystem": MEMORY,
+        "action": rec["action"],
+        "summary": rec.get("summary", ""),
+        "origin": rec.get("origin", "foreground"),
+        "created_at": rec["created_at"],
+        "payload": rec["payload"],
+        "queue_status": rec["status"],
+        "kind": rec["kind"],
+    }
+
+
 def list_pending(subsystem: str) -> List[Dict[str, Any]]:
-    """Return all pending records for ``subsystem``, oldest first."""
+    """Return active pending records for ``subsystem``, oldest first."""
+    if subsystem == MEMORY:
+        from tools import memory_pending_queue as pq
+        return [_memory_pending_record(r) for r in pq.list_active()]
+
     d = _pending_dir(subsystem)
     if not d.exists():
         return []
@@ -167,7 +237,14 @@ def list_pending(subsystem: str) -> List[Dict[str, Any]]:
 
 
 def get_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
-    """Return a single pending record by id, or None."""
+    """Return a single active pending record by id, or None."""
+    if subsystem == MEMORY:
+        from tools import memory_pending_queue as pq
+        rec = pq.get(pending_id)
+        if rec is None or rec["status"] not in pq.ACTIVE_STATUSES:
+            return None
+        return _memory_pending_record(rec)
+
     path = _pending_dir(subsystem) / f"{pending_id}.json"
     if not path.exists():
         return None
@@ -178,7 +255,11 @@ def get_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
 
 
 def discard_pending(subsystem: str, pending_id: str) -> bool:
-    """Delete a pending record. Returns True if it existed."""
+    """Reject a pending record. Returns True if it was active."""
+    if subsystem == MEMORY:
+        from tools import memory_pending_queue as pq
+        return pq.discard(pending_id, reason="rejected by approval handler")
+
     path = _pending_dir(subsystem) / f"{pending_id}.json"
     try:
         if path.exists():
@@ -189,8 +270,20 @@ def discard_pending(subsystem: str, pending_id: str) -> bool:
     return False
 
 
+def complete_pending(subsystem: str, pending_id: str) -> bool:
+    """Mark an explicitly approved memory record done without deleting history."""
+    if subsystem == MEMORY:
+        from tools import memory_pending_queue as pq
+        return pq.complete(pending_id)
+    return discard_pending(subsystem, pending_id)
+
+
 def pending_count(subsystem: str) -> int:
-    """Cheap count of pending records (for notification badges)."""
+    """Count active pending records for notification badges."""
+    if subsystem == MEMORY:
+        from tools import memory_pending_queue as pq
+        return pq.count_active()
+
     d = _pending_dir(subsystem)
     if not d.exists():
         return 0

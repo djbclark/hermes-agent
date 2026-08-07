@@ -102,6 +102,12 @@ class TestScanMemoryContent:
 def store(tmp_path, monkeypatch):
     """Create a MemoryStore with temp storage."""
     monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+    # The overflow queue lives in a separate SQLite db under HERMES_HOME
+    # (tools/memory_pending_queue.py) -- point it at the same temp dir so
+    # overflow tests never touch the real ~/.hermes.
+    monkeypatch.setattr("tools.memory_pending_queue.get_hermes_home", lambda: tmp_path)
+    import tools.memory_pending_queue as pq
+    pq._INITIALIZED_PATHS.clear()
     s = MemoryStore(memory_char_limit=500, user_char_limit=300)
     s.load_from_disk()
     return s
@@ -127,12 +133,15 @@ class TestMemoryStoreAdd:
         assert result["queued"] is True
         assert result["done"] is True
         assert "this will exceed the limit" not in store.memory_entries
-        pending = Path(result["pending_path"])
-        assert pending.exists()
-        assert pending.stat().st_mode & 0o777 == 0o600
-        payload = json.loads(pending.read_text())
-        assert payload["target"] == "memory"
-        assert payload["operations"] == [{"action": "add", "content": "this will exceed the limit"}]
+        from tools import memory_pending_queue as pq
+        pending = pq.get(result["pending_id"])
+        assert pending is not None
+        assert pending["status"] == pq.STATUS_PENDING
+        assert pending["kind"] == pq.KIND_OVERFLOW
+        assert pending["target"] == "memory"
+        assert pending["payload"]["content"] == "this will exceed the limit"
+        assert pq.queue_db_path().exists()
+        assert pq.queue_db_path().stat().st_mode & 0o777 == 0o600
 
         # A replace that blows the budget mirrors the add-overflow shape.
         result = store.replace("memory", "x" * 490, "y" * 600)

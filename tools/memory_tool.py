@@ -25,7 +25,6 @@ Design:
 
 import json
 import logging
-import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -396,52 +395,78 @@ class MemoryStore:
         current: Optional[int] = None,
         limit: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Durably queue a valid write that cannot fit in the bounded store.
+        """Durably enqueue a valid write that cannot fit in the bounded store.
 
         The bounded always-loaded store must not silently evict data, but a
-        rejected memory write must not disappear either.  Store the already
-        threat-scanned operation in a mode-0600 JSON journal for the curator
-        to review and merge later.  This is deliberately not auto-applied:
+        rejected memory write must not disappear either. The already
+        threat-scanned operation is queued in the shared SQLite pending-op
+        store (``tools/memory_pending_queue.py`` -- the same durable queue
+        ``write_approval`` stages approval-gated writes into) for curator/user
+        review via ``/memory pending``. This is deliberately not auto-applied:
         choosing which existing fact to remove or rewrite is semantic work.
+
+        The response is explicit that nothing landed in the always-loaded
+        store: ``durable=True`` (the write cannot be lost) but
+        ``active_in_prompt=False`` (it is not yet part of what future turns
+        see) -- the model must not report this as "saved to memory".
         """
-        pending_dir = get_memory_dir() / "pending"
-        pending_dir.mkdir(parents=True, exist_ok=True)
-        pending_dir.chmod(0o700)
-        payload = {
-            "schema": 1,
-            "queued_at": time.time(),
-            "target": target,
-            "operations": operations,
-            "usage": {
-                "current": self._char_count(target) if current is None else current,
-                "limit": self._char_limit(target) if limit is None else limit,
-            },
-        }
-        filename = f"queued-{time.time_ns()}-{os.getpid()}.json"
-        path = pending_dir / filename
-        # O_EXCL prevents two sessions with the same clock resolution from
-        # overwriting one another's pending write.
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        from tools import memory_pending_queue as pq
+        from tools.write_approval import current_origin
+
+        action = operations[0]["action"] if len(operations) == 1 else "batch"
+        if action == "batch":
+            payload: Dict[str, Any] = {"action": "batch", "target": target, "operations": operations}
+        else:
+            op = operations[0]
+            payload = {
+                "action": action,
+                "target": target,
+                "content": op.get("content"),
+                "old_text": op.get("old_text"),
+            }
+
+        # replace/remove can clobber a fact someone else changed between now
+        # and when the curator replays the queue -- stamp the current store
+        # snapshot so a stale replay is detected as a conflict instead of
+        # blindly overwriting (see pq.is_stale / pq.mark_conflict).
+        needs_snapshot = any(op.get("action") in {"replace", "remove"} for op in operations)
+        expected_previous_hash = (
+            pq.content_snapshot_hash(ENTRY_DELIMITER.join(self._entries_for(target)))
+            if needs_snapshot else None
+        )
+
+        cur = self._char_count(target) if current is None else current
+        lim = self._char_limit(target) if limit is None else limit
+
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump(payload, stream, ensure_ascii=False, indent=2)
-                stream.write("\n")
-        except Exception:
-            try:
-                path.unlink()
-            except OSError:
-                pass
-            raise
+            record = pq.enqueue(
+                pq.KIND_OVERFLOW, action, target, payload,
+                summary=f"overflow {action} on {target}",
+                origin=current_origin(),
+                expected_previous_hash=expected_previous_hash,
+            )
+        except pq.QueueFullError as e:
+            return {
+                "success": False,
+                "done": True,
+                "error": str(e),
+                "queue_full": True,
+            }
+
         return {
             "success": True,
             "done": True,
+            "durable": True,
             "queued": True,
+            "active_in_prompt": False,
+            "pending_id": record["id"],
             "target": target,
-            "pending_path": str(path),
-            "usage": f"{payload['usage']['current']:,}/{payload['usage']['limit']:,}",
+            "usage": f"{cur:,}/{lim:,}",
             "message": (
-                "Memory is full, so the requested write was durably queued for "
-                "curator review; existing memory was not changed."
+                f"Memory is full, so the requested write was durably queued "
+                f"(pending_id={record['id']}) for curator review; existing "
+                f"memory was NOT changed and this content is NOT YET active "
+                f"in the system prompt."
             ),
             "note": "Queued memory is durable but not yet in the always-loaded prompt.",
         }
@@ -1007,6 +1032,11 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
         summary=f"{summary}: {detail[:120]}",
         origin=wa.current_origin(),
     )
+    if record.get("staging_error"):
+        return tool_error(
+            f"Could not durably stage memory write: {record['staging_error']}",
+            success=False,
+        )
     return json.dumps(
         {"success": True, "staged": True, "pending_id": record["id"],
          "message": decision.message},
@@ -1054,6 +1084,11 @@ def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Op
         summary=f"{summary}: {detail[:120]}",
         origin=wa.current_origin(),
     )
+    if record.get("staging_error"):
+        return tool_error(
+            f"Could not durably stage memory write: {record['staging_error']}",
+            success=False,
+        )
     return json.dumps(
         {"success": True, "staged": True, "pending_id": record["id"],
          "message": decision.message},
@@ -1180,15 +1215,32 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
     """Replay a staged memory write directly against the store, bypassing the
     write gate. Called by the /memory approve handler.
 
-    Returns the store's result dict.
+    Replace/remove operations use the enqueue-time snapshot hash to reject
+    stale approvals. Add is idempotent for an already-present entry so a lease
+    retry cannot append the same fact twice.
     """
+    from tools import memory_pending_queue as pq
+
     action = payload.get("action")
     target = payload.get("target", "memory")
     content = payload.get("content") or ""
     old_text = payload.get("old_text") or ""
+    expected_hash = payload.get("expected_previous_hash")
+    if expected_hash and action in {"replace", "remove", "batch"}:
+        current_hash = pq.content_snapshot_hash(
+            ENTRY_DELIMITER.join(store._entries_for(target))
+        )
+        if current_hash != expected_hash:
+            return {
+                "success": False,
+                "conflict": True,
+                "error": "Memory changed since this write was staged; review it again.",
+            }
     if action == "batch":
         return store.apply_batch(target, payload.get("operations") or [])
     if action == "add":
+        if content in store._entries_for(target):
+            return {"success": True, "idempotent": True, "target": target}
         return store.add(target, content)
     if action == "replace":
         return store.replace(target, old_text, content)

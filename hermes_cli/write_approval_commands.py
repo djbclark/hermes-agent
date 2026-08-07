@@ -38,6 +38,8 @@ def _fmt_pending_list(subsystem: str) -> str:
     for r in records:
         origin = r.get("origin", "foreground")
         tag = " [auto]" if origin == "background_review" else ""
+        if r.get("kind") == "overflow":
+            tag += " [overflow]"
         lines.append(f"  {r['id']}{tag}  {r.get('summary', '')}")
     where = "/{s} approve <id>".format(s=subsystem)
     lines.append("")
@@ -126,7 +128,7 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
     for rec in targets:
         ok, msg = _apply_one(subsystem, rec, memory_store)
         if ok:
-            wa.discard_pending(subsystem, rec["id"])
+            wa.complete_pending(subsystem, rec["id"])
             applied += 1
         else:
             failed.append(f"{rec['id']}: {msg}")
@@ -146,6 +148,8 @@ def _apply_one(subsystem: str, rec, memory_store):
                 return False, "memory store unavailable"
             from tools.memory_tool import apply_memory_pending
             result = apply_memory_pending(payload, memory_store)
+            if result.get("success") and result.get("queued"):
+                return False, "memory projection is still full; pending record remains queued"
             return bool(result.get("success")), result.get("error", "")
         else:
             from tools.skill_manager_tool import apply_skill_pending

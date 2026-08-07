@@ -170,6 +170,22 @@ def test_handle_approve_all(hermes_home):
     assert len(store.user_entries) == 2
 
 
+def test_overflow_is_visible_and_rejectable_via_memory_pending(hermes_home):
+    from tools.memory_tool import MemoryStore
+    from tools import write_approval as wa
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+
+    store = MemoryStore(memory_char_limit=10, user_char_limit=10)
+    store.add("memory", "123456789")
+    result = store.add("memory", "overflow")
+    pending = wa.list_pending(wa.MEMORY)
+    assert any(r["id"] == result["pending_id"] and r["kind"] == "overflow" for r in pending)
+    listing = handle_pending_subcommand(wa.MEMORY, ["pending"], memory_store=store)
+    assert listing is not None and "[overflow]" in listing
+    assert wa.discard_pending(wa.MEMORY, result["pending_id"]) is True
+    assert wa.get_pending(wa.MEMORY, result["pending_id"]) is None
+
+
 def test_handle_approval_on(hermes_home):
     from hermes_cli.write_approval_commands import handle_pending_subcommand
     from tools import write_approval as wa
