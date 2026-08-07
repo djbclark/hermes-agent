@@ -1738,6 +1738,7 @@ async def _send_signal(extra, chat_id, message, media_files=None):
             scheduler.state(), len(attachment_paths), len(att_batches),
         )
         failed_batches: list[int] = []
+        transport_failures: list[str] = []
         for idx, att_batch in enumerate(att_batches):
             n = len(att_batch)
             if n > 0:
@@ -1788,9 +1789,11 @@ async def _send_signal(extra, chat_id, message, media_files=None):
                 except Exception as e:
                     if attempt >= SIGNAL_RATE_LIMIT_MAX_ATTEMPTS:
                         failed_batches.append(idx + 1)
+                        failure = f"{type(e).__name__}: {e}".strip()
+                        transport_failures.append(failure)
                         logger.error(
                             "Signal: send error on batch %d/%d after %d attempts: %s",
-                            idx + 1, len(att_batches), attempt, str(e)
+                            idx + 1, len(att_batches), attempt, failure
                         )
                         break
                     logger.warning(
@@ -1808,6 +1811,11 @@ async def _send_signal(extra, chat_id, message, media_files=None):
             )
 
         if failed_batches and len(failed_batches) == len(att_batches):
+            if transport_failures:
+                return _error(
+                    f"Signal: every batch ({len(att_batches)}) failed at the daemon transport: "
+                    f"{transport_failures[0]}"
+                )
             return _error(
                 f"Signal: every batch ({len(att_batches)}) hit rate limit; "
                 f"no attachments delivered"

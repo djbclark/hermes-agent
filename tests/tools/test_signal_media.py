@@ -62,6 +62,40 @@ class TestSendSignalMediaFiles:
         assert result["platform"] == "signal"
         assert result["chat_id"] == "+155****9999"
 
+    def test_connection_failure_is_not_reported_as_rate_limit(self, monkeypatch):
+        """Daemon transport failures must identify transport, not rate limiting."""
+        class FailingClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                pass
+
+            async def post(self, *args, **kwargs):
+                raise ConnectionError("connection refused")
+
+        httpx_mock = _make_httpx_mock()
+        httpx_mock.AsyncClient = lambda timeout=None: FailingClient()
+        monkeypatch.setitem(sys.modules, "httpx", httpx_mock)
+
+        from tools.send_message_tool import _send_signal
+
+        with patch(
+            "gateway.platforms.signal_rate_limit.SIGNAL_RATE_LIMIT_MAX_ATTEMPTS",
+            1,
+        ):
+            result = asyncio.run(
+                _send_signal(
+                    {"http_url": "http://127.0.0.1:18080", "account": "+155****4567"},
+                    "+155****9999",
+                    "Hello world",
+                )
+            )
+
+        assert "error" in result
+        assert "daemon transport" in result["error"]
+        assert "ConnectionError: connection refused" in result["error"]
+        assert "rate limit" not in result["error"].lower()
 
     def test_send_signal_with_missing_media_file(self):
         """Missing media files should generate warnings but not fail."""
