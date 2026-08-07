@@ -43,14 +43,23 @@ after a consumer applies a write but before it acknowledges, so consumers must
 make application idempotent or use expected-version checks. Rows are
 dead-lettered by status, not by disappearing.
 
-Migration note (documented, not yet automated in this slice): any pre-existing
-JSON files under ``memories/pending/*.json`` (memory_tool overflow) or
-``pending/memory/*.json`` (write_approval staging) from before this module
-existed are NOT auto-imported. They remain readable on disk (nothing deletes
-them) but are invisible to ``/memory pending`` until manually replayed through
-``memory_tool``/``write_approval`` once more. See the "Remaining limitations"
-section of the introducing commit message for the follow-up needed to import
-them automatically on first open.
+Legacy JSON migration: any pre-existing JSON files under
+``memories/pending/*.json`` (memory_tool overflow) or ``pending/memory/*.json``
+(write_approval staging) from before this module existed are imported
+automatically, once per process, the first time this module opens a
+connection (see the migration trigger in :func:`_connection` and
+:mod:`tools.memory_pending_migration` for the full idempotency/crash-safety
+contract). Imported records are visible to ``/memory pending`` immediately.
+Originals are archived into a ``migrated/`` sibling directory after a
+successful import -- never deleted -- and a file that fails to import is left
+in place and retried on the next call.
+
+This module provides durable journal + review storage only. There is
+currently no automated consumer that reviews and applies queued records on
+its own -- resolution happens via the existing ``/memory pending`` /
+``/memory approve`` / ``/memory reject`` commands (or direct claim/lease API
+for a future curator process). Do not describe this queue as having an
+automatic "curator" that reviews and merges entries; none exists yet.
 """
 
 from __future__ import annotations
@@ -155,6 +164,16 @@ CREATE INDEX IF NOT EXISTS idx_pending_ops_content_hash
 _INIT_LOCK = threading.Lock()
 _INITIALIZED_PATHS: set = set()
 
+# Guards the legacy-JSON migration trigger (see tools/memory_pending_migration).
+# Separate from _INIT_LOCK because migration itself opens nested connections
+# (pq.import_legacy -> _connection()) on the same thread; a single non-
+# reentrant lock held across the migration call would deadlock. Instead this
+# lock is held only long enough to claim the "run migration" flag, which is
+# set BEFORE migration runs -- so the nested _connection() calls the
+# migration makes see the path already claimed and skip straight through.
+_MIGRATION_LOCK = threading.Lock()
+_MIGRATED_PATHS: set = set()
+
 
 def queue_db_path() -> Path:
     """Profile-scoped path of the shared pending-operation database."""
@@ -209,6 +228,20 @@ def _connection():
             sidecar = Path(f"{path}{suffix}")
             if sidecar.exists():
                 _restrict_permissions(sidecar, is_dir=False)
+
+        run_migration = False
+        if resolved not in _MIGRATED_PATHS:
+            with _MIGRATION_LOCK:
+                if resolved not in _MIGRATED_PATHS:
+                    _MIGRATED_PATHS.add(resolved)
+                    run_migration = True
+        if run_migration:
+            try:
+                from tools import memory_pending_migration as _mig
+                _mig.migrate_legacy_pending()
+            except Exception:
+                logger.exception("Legacy pending-queue migration failed")
+
         yield conn
     finally:
         conn.close()
@@ -339,6 +372,104 @@ def enqueue(
                 "SELECT * FROM pending_ops WHERE id=?", (rec_id,)
             ).fetchone()
             return _row_to_record(row)
+
+
+def import_legacy(
+    id_hint: str,
+    kind: str,
+    action: str,
+    target: str,
+    payload: Dict[str, Any],
+    *,
+    summary: str = "",
+    origin: str = "foreground",
+    expected_previous_hash: Optional[str] = None,
+    created_at: Optional[float] = None,
+    cap: int = DEFAULT_QUEUE_CAP,
+) -> "tuple[Dict[str, Any], bool]":
+    """Idempotently import one pre-existing legacy JSON pending record.
+
+    Used only by :mod:`tools.memory_pending_migration` to fold the old
+    ``memories/pending/*.json`` and ``pending/memory/*.json`` files into this
+    database. Distinct from :func:`enqueue` in one deliberate way: dedup is
+    keyed primarily on ``id_hint`` -- a deterministic id the caller derives
+    from the legacy file's identity (e.g. its filename) -- rather than on
+    active-only content hash. That makes re-running migration against a
+    legacy file that hasn't been archived yet a true no-op even after the
+    imported record reaches a terminal status, which matters because
+    migration only archives (moves) a legacy file *after* a successful
+    import; a crash in between must not risk a duplicate on retry.
+
+    Falls back to the normal active content-hash dedup so a legacy record
+    that some other path already re-enqueued live (same kind/action/target/
+    payload, different id) is not duplicated either.
+
+    Always inserted as ``pending`` -- both legacy stores only ever kept
+    unresolved records on disk (nothing consumed or deleted them before this
+    queue existed).
+
+    Returns ``(record, inserted)`` where ``inserted`` is False when an
+    existing row (by id or by content hash) was returned instead of a new
+    one being created.
+
+    Raises :class:`QueueFullError` -- without inserting a row -- under the
+    same cap semantics as :func:`enqueue`, so a full queue leaves the legacy
+    file unarchived (and therefore retried on the next migration pass)
+    instead of silently losing the record.
+    """
+    if kind not in _KINDS:
+        raise ValueError(f"invalid kind {kind!r}; use one of {_KINDS}")
+    if not id_hint:
+        raise ValueError("id_hint is required")
+
+    chash = content_hash(kind, action, target, payload)
+    now = time.time()
+    created = now if created_at is None else float(created_at)
+
+    with _connection() as conn:
+        with write_txn(conn):
+            existing_by_id = conn.execute(
+                "SELECT * FROM pending_ops WHERE id=?", (id_hint,)
+            ).fetchone()
+            if existing_by_id is not None:
+                return _row_to_record(existing_by_id), False
+
+            existing_by_hash = conn.execute(
+                "SELECT * FROM pending_ops WHERE content_hash=? AND status IN (?,?,?) "
+                "ORDER BY created_at LIMIT 1",
+                (chash, STATUS_PENDING, STATUS_PROCESSING, STATUS_FAILED),
+            ).fetchone()
+            if existing_by_hash is not None:
+                return _row_to_record(existing_by_hash), False
+
+            active_count = conn.execute(
+                "SELECT COUNT(*) FROM pending_ops WHERE status IN (?,?,?)",
+                (STATUS_PENDING, STATUS_PROCESSING, STATUS_FAILED),
+            ).fetchone()[0]
+            if active_count >= cap:
+                raise QueueFullError(cap)
+
+            conn.execute(
+                """
+                INSERT INTO pending_ops (
+                    id, kind, action, target, payload, summary, origin,
+                    content_hash, expected_previous_hash, status, attempts,
+                    next_attempt_at, lease_owner, lease_expires_at,
+                    error_detail, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, NULL, ?, ?)
+                """,
+                (
+                    id_hint, kind, action, target,
+                    json.dumps(payload, ensure_ascii=False),
+                    summary or "", origin or "foreground",
+                    chash, expected_previous_hash, STATUS_PENDING,
+                    created, now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM pending_ops WHERE id=?", (id_hint,)
+            ).fetchone()
+            return _row_to_record(row), True
 
 
 # ---------------------------------------------------------------------------

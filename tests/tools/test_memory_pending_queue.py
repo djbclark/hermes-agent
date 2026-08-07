@@ -348,3 +348,101 @@ class TestDiscard:
         pq.claim_next("curator")
         pq.mark_done(rec["id"], "curator")
         assert pq.discard(rec["id"]) is False
+
+
+# ===========================================================================
+# import_legacy -- id-keyed idempotent insert used by legacy JSON migration
+# ===========================================================================
+
+class TestImportLegacy:
+    def test_import_inserts_with_requested_id_and_preserves_created_at(self, hermes_home):
+        import tools.memory_pending_queue as pq
+
+        record, inserted = pq.import_legacy(
+            "legacy-overflow-queued-123-456",
+            pq.KIND_OVERFLOW, "add", "memory",
+            _payload(content="migrated fact"),
+            summary="overflow add on memory (migrated)",
+            origin="foreground",
+            created_at=1000.0,
+        )
+        assert inserted is True
+        assert record["id"] == "legacy-overflow-queued-123-456"
+        assert record["created_at"] == 1000.0
+        assert record["status"] == "pending"
+        assert pq.get("legacy-overflow-queued-123-456")["payload"]["content"] == "migrated fact"
+
+    def test_reimport_same_id_is_idempotent_noop(self, hermes_home):
+        import tools.memory_pending_queue as pq
+
+        first, first_inserted = pq.import_legacy(
+            "legacy-id-1", pq.KIND_OVERFLOW, "add", "memory",
+            _payload(content="fact"), created_at=1000.0,
+        )
+        assert first_inserted is True
+
+        second, second_inserted = pq.import_legacy(
+            "legacy-id-1", pq.KIND_OVERFLOW, "add", "memory",
+            _payload(content="fact"), created_at=1000.0,
+        )
+        assert second_inserted is False
+        assert second["id"] == first["id"]
+        assert pq.count_active() == 1
+
+    def test_reimport_after_resolution_is_still_idempotent_on_id(self, hermes_home):
+        """Unlike enqueue(), import_legacy dedupes on the deterministic legacy
+        id even once the record reaches a terminal state -- re-running
+        migration against a not-yet-archived file must never create a
+        second row for the same original record."""
+        import tools.memory_pending_queue as pq
+
+        rec, _ = pq.import_legacy(
+            "legacy-id-2", pq.KIND_OVERFLOW, "add", "memory", _payload(),
+        )
+        pq.claim_next("curator")
+        pq.mark_done(rec["id"], "curator")
+
+        again, inserted = pq.import_legacy(
+            "legacy-id-2", pq.KIND_OVERFLOW, "add", "memory", _payload(),
+        )
+        assert inserted is False
+        assert again["id"] == "legacy-id-2"
+        assert again["status"] == "done"
+        assert pq.count_active() == 0
+
+    def test_import_dedupes_against_live_content_hash_when_id_differs(self, hermes_home):
+        """If the same logical operation was already enqueued live (e.g. the
+        upgraded code ran once before migration caught up), importing the
+        legacy copy under a different id must not duplicate it."""
+        import tools.memory_pending_queue as pq
+
+        live = pq.enqueue(pq.KIND_OVERFLOW, "add", "memory", _payload(content="dup"))
+        imported, inserted = pq.import_legacy(
+            "legacy-different-id", pq.KIND_OVERFLOW, "add", "memory",
+            _payload(content="dup"),
+        )
+        assert inserted is False
+        assert imported["id"] == live["id"]
+        assert pq.count_active() == 1
+
+    def test_import_raises_queue_full_without_inserting(self, hermes_home):
+        import tools.memory_pending_queue as pq
+
+        pq.enqueue(pq.KIND_OVERFLOW, "add", "memory", _payload(content="a"), cap=1)
+        with pytest.raises(pq.QueueFullError):
+            pq.import_legacy(
+                "legacy-id-3", pq.KIND_OVERFLOW, "add", "memory",
+                _payload(content="b"), cap=1,
+            )
+        assert pq.get("legacy-id-3") is None
+
+    def test_import_preserves_expected_previous_hash(self, hermes_home):
+        import tools.memory_pending_queue as pq
+
+        h = pq.content_snapshot_hash("v1")
+        rec, _ = pq.import_legacy(
+            "legacy-id-4", pq.KIND_APPROVAL, "replace", "memory",
+            _payload(action="replace", old_text="a", content="b"),
+            expected_previous_hash=h,
+        )
+        assert rec["expected_previous_hash"] == h
