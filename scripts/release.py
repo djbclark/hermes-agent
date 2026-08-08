@@ -2119,6 +2119,13 @@ def git_result(*args, cwd=None):
     )
 
 
+def get_origin_repo_slug() -> str:
+    """Return the GitHub owner/repo for origin, or the upstream default."""
+    remote = git("remote", "get-url", "origin")
+    match = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", remote)
+    return match.group(1) if match else "NousResearch/hermes-agent"
+
+
 def get_last_tag():
     """Get the most recent CalVer tag."""
     tags = git("tag", "--list", "v20*", "--sort=-v:refname")
@@ -2475,6 +2482,8 @@ def main():
                         help="Mark as first release (no previous tag expected)")
     parser.add_argument("--output", type=str,
                         help="Write changelog to file instead of stdout")
+    parser.add_argument("--repo", type=str,
+                        help="GitHub owner/repo (default: derive from origin remote)")
     args = parser.parse_args()
 
     # Determine CalVer date
@@ -2524,8 +2533,11 @@ def main():
     print()
 
     # Generate changelog
+    repo_slug = args.repo or get_origin_repo_slug()
+    repo_url = f"https://github.com/{repo_slug}"
     changelog = generate_changelog(
         commits, tag_name, new_version,
+        repo_url=repo_url,
         prev_tag=prev_tag,
         first_release=args.first_release,
     )
@@ -2586,6 +2598,7 @@ def main():
 
         gh_cmd = [
             "gh", "release", "create", tag_name,
+            "--repo", repo_slug,
             "--title", f"Hermes Agent v{new_version} ({calver_date})",
             "--notes-file", str(changelog_file),
         ]
@@ -2612,7 +2625,7 @@ def main():
             print(f"    Release notes kept at: {changelog_file}")
             print("    Tag was created locally. Create the release manually:")
             print(
-                f"    gh release create {tag_name} --title 'Hermes Agent v{new_version} ({calver_date})' "
+                f"    gh release create {tag_name} --repo {repo_slug} --title 'Hermes Agent v{new_version} ({calver_date})' "
                 f"--notes-file .release_notes.md"
             )
             print(f"\n  ✓ Release v{new_version} ({tag_name}) prepared for manual publish.")
