@@ -91,6 +91,30 @@ def _init_code_repo(path):
     (path / "main.py").write_text("print('hi')\n")
 
 
+
+
+class TestMemoryJournalStatus:
+    def test_empty_journal_adds_no_status_block(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        parts = _prompt_parts(_make_agent())
+        assert "memory-journal-status" not in parts["volatile"]
+
+    def test_status_is_metadata_only(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        from tools import memory_pending_queue as pq
+
+        pq.enqueue(
+            pq.KIND_OVERFLOW,
+            "add",
+            "memory",
+            {"action": "add", "target": "memory", "content": "secret queued fact"},
+        )
+        parts = _prompt_parts(_make_agent())
+        assert "<memory-journal-status>" in parts["volatile"]
+        assert "active=1" in parts["volatile"]
+        assert "secret queued fact" not in parts["volatile"]
+
+
 class TestCodingContextBlock:
     def test_injected_when_active(self, monkeypatch, tmp_path):
         _init_code_repo(tmp_path)

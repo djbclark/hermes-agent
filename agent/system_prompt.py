@@ -149,6 +149,36 @@ def _tui_embedded_pane_clarifier(hint: str) -> str:
     return hint + _TUI_EMBEDDED_PANE_CLARIFIER
 
 
+def _memory_journal_status_block() -> str:
+    """Return metadata-only pending-journal status for a fresh prompt.
+
+    This is intentionally session-scoped: it does not read pending payloads and
+    does not rebuild the prompt mid-turn, preserving the prompt-cache contract.
+    """
+    try:
+        from tools import memory_projection
+        status = memory_projection.get_status()
+    except Exception:
+        return ""
+    if not status.get("active_count") and not status.get("dead_letter_count"):
+        return ""
+    parts = [
+        f"active={status['active_count']}",
+        f"dead_letter={status['dead_letter_count']}",
+    ]
+    if status.get("behind"):
+        parts.append("behind=true")
+    return (
+        "<memory-journal-status>\n"
+        "[System note: durable memory operations exist outside the current "
+        "always-loaded memory snapshot. Do not treat queued content as active "
+        "memory; use `hermes memory-journal status` or run the deterministic "
+        "consumer when appropriate.]\n"
+        + " ".join(parts)
+        + "\n</memory-journal-status>"
+    )
+
+
 def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
     """Assemble the system prompt as three ordered cache tiers.
 
@@ -519,6 +549,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
                 volatile_parts.append(_ext_mem_block)
         except Exception:
             pass
+
+    journal_status = _memory_journal_status_block()
+    if journal_status:
+        volatile_parts.append(journal_status)
 
     from hermes_time import now as _hermes_now
     now = _hermes_now()
