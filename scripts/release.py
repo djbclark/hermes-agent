@@ -2560,6 +2560,9 @@ def main():
 
             # Commit version bump
             add_files = [str(VERSION_FILE), str(PYPROJECT_FILE)]
+            desktop_pkg = REPO_ROOT / "apps" / "desktop" / "package.json"
+            if desktop_pkg.exists():
+                add_files.append(str(desktop_pkg))
             add_result = git_result("add", *add_files)
             if add_result.returncode != 0:
                 print(f"  ✗ Failed to stage version files: {add_result.stderr.strip()}")
