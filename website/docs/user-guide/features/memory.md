@@ -145,6 +145,22 @@ The `/memory pending` review path lists both approval-gated and overflow
 operations. A queued item is durable but is not visible in the always-loaded
 system-prompt snapshot until it is incorporated and a new session starts.
 
+The deterministic consumer can be inspected and run without an LLM:
+
+```bash
+hermes memory-journal status --json
+hermes memory-journal run --max-records 100 --json
+hermes memory-journal list-dead
+hermes memory-journal list-evicted --target memory
+```
+
+`memory-journal run` claims records with a lease, applies them idempotently, and
+keeps the bounded projection within its limit by evicting the oldest unpinned,
+untouched entries first. Evictions remain auditable in the SQLite journal; an
+unresolvable pinned-only projection is dead-lettered rather than retried
+forever. Semantic/LLM curation can improve promotion choices later, but is not
+required for durability or boundedness.
+
 **Best practice:** When memory is above 70% capacity (visible in the system
 prompt header), consolidate entries before adding new ones. The queue is a
 loss-prevention fallback, not permission to let the bounded store grow without

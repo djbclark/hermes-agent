@@ -10544,7 +10544,8 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights",
-        "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
+        "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory",
+        "memory-journal", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "monitoring", "pairing", "pets", "plugins", "portal", "profile",
         "project", "proxy",
@@ -11672,6 +11673,23 @@ def main():
     # memory command  (parser built in hermes_cli/subcommands/memory.py)
     # =========================================================================
     build_memory_parser(subparsers, cmd_memory=cmd_memory)
+
+    # =========================================================================
+    # memory-journal command — deterministic journal consumer (no LLM)
+    # =========================================================================
+    memory_journal_parser = subparsers.add_parser(
+        "memory-journal",
+        help="Apply queued memory writes from the durable journal (status, run, list-dead)",
+        description=(
+            "Deterministic, non-LLM consumer for the memory write journal "
+            "(tools/memory_pending_queue.py). Claims queued overflow/approval "
+            "writes under a lease, applies them to MEMORY.md/USER.md, evicting "
+            "entries by deterministic rule when full instead of re-queuing."
+        ),
+    )
+    from hermes_cli.subcommands.memory_journal import register_cli as _register_memory_journal_cli
+
+    _register_memory_journal_cli(memory_journal_parser)
 
     # =========================================================================
     # tools command  (parser built in hermes_cli/subcommands/tools.py)

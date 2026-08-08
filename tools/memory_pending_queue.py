@@ -156,6 +156,24 @@ CREATE INDEX IF NOT EXISTS idx_pending_ops_status_created
 
 CREATE INDEX IF NOT EXISTS idx_pending_ops_content_hash
     ON pending_ops(content_hash);
+
+-- Audit trail for entries the deterministic projection consumer evicted from
+-- a full MEMORY.md/USER.md store to make room for an applied journal record
+-- (see tools/memory_projection.py). Rows are append-only: eviction is never
+-- silent data loss -- the original entry text is preserved here for the user
+-- to recover (a future ``/memory evicted`` review surface, or manual re-add)
+-- even though it is gone from the bounded live store.
+CREATE TABLE IF NOT EXISTS evicted_entries (
+    id                TEXT PRIMARY KEY,
+    target            TEXT NOT NULL,
+    entry_text        TEXT NOT NULL,
+    evicted_by_id     TEXT,
+    reason            TEXT NOT NULL DEFAULT '',
+    evicted_at        REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_evicted_entries_target_time
+    ON evicted_entries(target, evicted_at);
 """
 
 # Guards schema init + WAL activation, mirroring kanban_db.py's _INIT_LOCK:
@@ -698,3 +716,74 @@ def mark_conflict(record_id: str, owner: str, error_detail: str) -> bool:
                 (STATUS_DEAD, error_detail, now, record_id, owner),
             )
             return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Eviction audit trail (projection consumer -- see tools/memory_projection.py)
+# ---------------------------------------------------------------------------
+
+def record_eviction(
+    target: str,
+    entry_text: str,
+    *,
+    evicted_by_id: Optional[str] = None,
+    reason: str = "capacity",
+) -> Dict[str, Any]:
+    """Durably archive one entry evicted from a bounded memory store.
+
+    Never overwrites or deletes -- each call inserts a new row, so the same
+    entry text evicted twice (e.g. re-added, then evicted again later) is
+    recorded twice. ``evicted_by_id`` is the journal record whose application
+    triggered the eviction, for traceability; it is NOT a foreign key
+    (the pending_ops row may itself be pruned/archived independently).
+    """
+    now = time.time()
+    rec_id = uuid.uuid4().hex[:12]
+    with _connection() as conn:
+        with write_txn(conn):
+            conn.execute(
+                "INSERT INTO evicted_entries "
+                "(id, target, entry_text, evicted_by_id, reason, evicted_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (rec_id, target, entry_text, evicted_by_id, reason, now),
+            )
+    return {
+        "id": rec_id,
+        "target": target,
+        "entry_text": entry_text,
+        "evicted_by_id": evicted_by_id,
+        "reason": reason,
+        "evicted_at": now,
+    }
+
+
+def list_evictions(*, target: Optional[str] = None, limit: int = 200) -> List[Dict[str, Any]]:
+    """Most recent evicted entries first, optionally filtered by target.
+
+    Bounded by ``limit`` -- this is an audit/recovery surface, not something
+    meant to be dumped into a prompt in full.
+    """
+    clauses, params = [], []
+    if target is not None:
+        clauses.append("target=?")
+        params.append(target)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(int(limit))
+    with _connection() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM evicted_entries {where} ORDER BY evicted_at DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def count_evictions(*, target: Optional[str] = None) -> int:
+    clauses, params = [], []
+    if target is not None:
+        clauses.append("target=?")
+        params.append(target)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with _connection() as conn:
+        return conn.execute(
+            f"SELECT COUNT(*) FROM evicted_entries {where}", params
+        ).fetchone()[0]
