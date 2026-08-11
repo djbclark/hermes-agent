@@ -374,6 +374,7 @@ class TestStatus:
             "processing_count": 0,
             "failed_count": 0,
             "dead_letter_count": 0,
+            "evicted_count": 0,
             "oldest_age_seconds": 0.0,
             "last_error": None,
             "last_error_record_id": None,
