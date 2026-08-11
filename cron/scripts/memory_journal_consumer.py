@@ -80,8 +80,9 @@ def main() -> int:
     status = memory_projection.get_status()
     _append_metrics_line(status)
 
+    # Healthy idle polls remain silent; metrics are retained locally for
+    # watchdogs and summaries. Only actual work or failures are user-visible.
     if not processed and not failures:
-        print(_format_metrics_summary(status))
         return 0
 
     parts = [f"Hermes memory journal processed {processed} record(s)."]

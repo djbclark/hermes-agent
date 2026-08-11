@@ -26,8 +26,8 @@ def _fake_store(memory_entries=(), user_entries=(), memory_char_limit=2200, user
     return store
 
 
-def test_main_idle_prints_metrics_summary(capsys):
-    """When nothing is processed, print the one-line metrics summary."""
+def test_main_idle_is_silent(capsys):
+    """When nothing is processed, retain metrics locally but print nothing."""
     with patch.object(
         memory_journal_consumer.memory_projection,
         "run_once",
@@ -45,12 +45,7 @@ def test_main_idle_prints_metrics_summary(capsys):
         assert memory_journal_consumer.main() == 0
 
     output = capsys.readouterr().out
-    assert "memory journal: ok" in output
-    assert "0 active" in output
-    assert "0 dead" in output
-    assert "2 evicted" in output
-    assert "0/2200 memory" in output
-    assert "0/1375 user" in output
+    assert output == ""
 
 
 def test_main_reports_processing_and_failures(capsys):
