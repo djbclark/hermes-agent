@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 from tools.delegate_tool import (
     _register_subagent,
     _unregister_subagent,
+    send_message_to_child,
     steer_subagent,
 )
 
@@ -52,6 +53,44 @@ def _with_registered(
             "owner_session_record": owner_session_record,
         }
     )
+
+
+def test_send_message_to_child_queues_through_steer():
+    agent = _StubAgent()
+    _with_registered("sid-message-1", agent)
+    try:
+        result = send_message_to_child("sid-message-1", "narrow the review")
+        assert result == {
+            "status": "queued",
+            "subagent_id": "sid-message-1",
+            "error": None,
+        }
+        assert agent.steered == ["narrow the review"]
+    finally:
+        _unregister_subagent("sid-message-1")
+
+
+def test_send_message_to_child_rejects_empty_or_unknown():
+    assert send_message_to_child("", "hello")["status"] == "rejected"
+    assert send_message_to_child("sid-missing", "hello")["status"] == "rejected"
+    assert send_message_to_child("sid-missing", "")["status"] == "rejected"
+
+
+def test_send_message_to_child_rejects_nested_child():
+    parent = MagicMock()
+    parent._delegate_depth = 1
+    assert send_message_to_child("sid-missing", "hello", parent_agent=parent) == {
+        "status": "rejected",
+        "error": "child agents cannot steer subagents",
+    }
+
+
+def test_send_message_to_child_is_registered_with_delegation_toolset():
+    from tools.registry import registry
+
+    schema = registry.get_schema("send_message_to_child")
+    assert schema["name"] == "send_message_to_child"
+    assert schema["parameters"]["required"] == ["subagent_id", "message"]
 
 
 def test_steer_reaches_the_live_child():

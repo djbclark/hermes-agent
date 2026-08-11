@@ -323,6 +323,62 @@ def list_active_subagents() -> List[Dict[str, Any]]:
         ]
 
 
+def send_message_to_child(
+    subagent_id: str,
+    message: str,
+    *,
+    parent_agent: Any = None,
+) -> Dict[str, Any]:
+    """Queue a message for a live child through the existing steer path.
+
+    This is the model-facing counterpart to the TUI ``subagent.steer`` RPC.
+    Gateway callers are bound to the exact originating session generation;
+    CLI callers have no transport authority and use the in-process helper
+    contract. Child agents cannot steer their own siblings or children.
+    """
+    subagent_id = str(subagent_id or "").strip()
+    message = str(message or "").strip()
+    if not subagent_id:
+        return {"status": "rejected", "error": "subagent_id is required"}
+    if not message:
+        return {"status": "rejected", "error": "message is required"}
+    if getattr(parent_agent, "_delegate_depth", 0) > 0:
+        return {"status": "rejected", "error": "child agents cannot steer subagents"}
+
+    owner_session_id = None
+    owner_transport = None
+    owner_session_record = None
+    try:
+        from gateway.session_context import get_session_env
+
+        owner_session_id = get_session_env("HERMES_UI_SESSION_ID", "") or None
+    except Exception:
+        pass
+    if owner_session_id:
+        owner_transport, owner_session_record = _capture_gateway_steer_authority(
+            owner_session_id
+        )
+        if owner_transport is None or owner_session_record is None:
+            return {
+                "status": "rejected",
+                "subagent_id": subagent_id,
+                "error": "originating session authority is unavailable",
+            }
+
+    queued = steer_subagent(
+        subagent_id,
+        message,
+        owner_session_id=owner_session_id,
+        owner_transport=owner_transport,
+        owner_session_record=owner_session_record,
+    )
+    return {
+        "status": "queued" if queued else "rejected",
+        "subagent_id": subagent_id,
+        "error": None if queued else "unknown, closed, or unauthorized subagent",
+    }
+
+
 def _extract_output_tail(
     result: Dict[str, Any],
     *,
@@ -4293,6 +4349,30 @@ DELEGATE_TASK_SCHEMA = {
 }
 
 
+SEND_MESSAGE_TO_CHILD_SCHEMA = {
+    "name": "send_message_to_child",
+    "description": (
+        "Send follow-up guidance to one live delegated child without stopping it. "
+        "The message is queued and delivered at the child's next safe iteration "
+        "boundary. Use the subagent_id returned by delegate_task."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "subagent_id": {
+                "type": "string",
+                "description": "The live child subagent_id returned by delegation.",
+            },
+            "message": {
+                "type": "string",
+                "description": "The follow-up instruction or message to queue.",
+            },
+        },
+        "required": ["subagent_id", "message"],
+    },
+}
+
+
 # --- Registry ---
 from tools.registry import registry, tool_error
 
@@ -4353,4 +4433,18 @@ registry.register(
     check_fn=check_delegate_requirements,
     emoji="🔀",
     dynamic_schema_overrides=_build_dynamic_schema_overrides,
+)
+
+
+registry.register(
+    name="send_message_to_child",
+    toolset="delegation",
+    schema=SEND_MESSAGE_TO_CHILD_SCHEMA,
+    handler=lambda args, **kw: send_message_to_child(
+        args.get("subagent_id"),
+        args.get("message"),
+        parent_agent=kw.get("parent_agent"),
+    ),
+    check_fn=check_delegate_requirements,
+    emoji="💬",
 )

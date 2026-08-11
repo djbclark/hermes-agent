@@ -294,7 +294,9 @@ Interrupting a child throws away its in-flight work; often you just want to redi
 {"method": "subagent.steer", "params": {"session_id": "owning-ui-session", "subagent_id": "sa-0-1a2b3c4d", "text": "focus on pricing instead"}}
 ```
 
-Subagent ids come from `delegation.status` (or `list_active_subagents()`) — the same place `subagent.interrupt` gets them. The gateway accepts steering only from the exact live UI/gateway session that spawned the child. A missing, foreign, ambiguous, or stale/recycled session identity is rejected; knowing a global subagent id is not authority. Direct in-process callers retain the unscoped helper contract deliberately.
+Subagent ids come from `delegate_task`'s returned handle, `delegation.status` (or `list_active_subagents()`) — the same place `subagent.interrupt` gets them. The gateway accepts steering only from the exact live UI/gateway session that spawned the child. A missing, foreign, ambiguous, or stale/recycled session identity is rejected; knowing a global subagent id is not authority. Direct in-process callers retain the unscoped helper contract deliberately.
+
+The parent model can use the delegation tool `send_message_to_child(subagent_id, message)` for the same operation without calling the gateway RPC directly. It returns `{"status": "queued", ...}` when the message is accepted, or `{"status": "rejected", ...}` when the child is unknown, closed, unauthorized, or the originating session authority is unavailable. Child agents cannot use it to steer other children.
 
 **Queued is not delivered, but it is never synthetic success.** A `"queued"` response means the text was accepted before the child's completion boundary, not necessarily that the child has seen it. Acceptance and completion are synchronized: either the child can still consume the text, or its exact text is drained into the result as `pending_steer`. Calls after closure return `"rejected"`. If a child accepted the steer but had already produced its final answer, the completion entry the parent receives retains it as `missed_steer`, with a note appended to the summary:
 
