@@ -14,20 +14,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
 import time
 from pathlib import Path
 
 from tools import memory_projection
 from tools.memory_tool import ENTRY_DELIMITER, load_on_disk_store
-
-# Gateway restart signal: the agent writes a trigger file when it needs to
-# restart the gateway (it cannot do so directly from inside the gateway's
-# process tree). This cron job runs from Jobber — a separate launchd service
-# — so launchctl kickstart is not blocked here. Check first so the restart
-# happens before any journal work.
-_SIGNAL = Path.home() / ".hermes" / ".gateway-restart-requested"
-
 _METRICS_PATH = Path.home() / ".hermes" / "logs" / "memory_journal_metrics.jsonl"
 _MAX_METRICS_BYTES = 100_000  # 100 KB
 
@@ -78,19 +69,6 @@ def _format_metrics_summary(status: dict) -> str:
 
 
 def main() -> int:
-    # Check for gateway restart signal before any journal work (see module
-    # docstring).  This cron runs from Jobber, outside the gateway's process
-    # tree, so launchctl kickstart is not blocked.
-    if _SIGNAL.exists():
-        _SIGNAL.unlink(missing_ok=True)
-        subprocess.run(
-            ["launchctl", "kickstart", "-k",
-             f"gui/{os.getuid()}/ai.hermes.gateway"],
-            timeout=30,
-        )
-        # Don't do journal work on this tick — restart signal was the sole task.
-        return 0
-
     result = memory_projection.run_once(max_records=100)
     processed = int(result.get("processed", 0))
     counts = result.get("counts", {})
