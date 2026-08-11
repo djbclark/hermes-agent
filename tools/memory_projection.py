@@ -279,12 +279,15 @@ def get_status(
         or bool(error_candidates)
     )
 
+    evicted_count = pq.count_evictions()
+
     return {
         "active_count": len(active),
         "pending_count": sum(1 for r in active if r["status"] == pq.STATUS_PENDING),
         "processing_count": len(processing),
         "failed_count": len(failed),
         "dead_letter_count": dead_letter_count,
+        "evicted_count": evicted_count,
         "oldest_age_seconds": oldest_age,
         "last_error": last_error_record.get("error_detail") if last_error_record else None,
         "last_error_record_id": last_error_record["id"] if last_error_record else None,

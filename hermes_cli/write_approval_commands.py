@@ -18,6 +18,9 @@ from __future__ import annotations
 import json
 from typing import List, Optional
 
+from tools import memory_pending_queue as pq
+from tools import memory_pending_migration as mpm
+from tools import memory_projection as mp
 from tools import write_approval as wa
 
 
@@ -95,6 +98,14 @@ def handle_pending_subcommand(
 
     if sub in {"approval", "mode"}:  # 'mode' kept as a back-compat alias
         return _set_approval(subsystem, rest, set_mode_fn)
+
+    # -- journal / eviction / migration (memory only) --
+    if sub == "migrate" and subsystem == wa.MEMORY:
+        return _migrate()
+    if sub == "evicted" and subsystem == wa.MEMORY:
+        return _evicted()
+    if sub == "journal" and subsystem == wa.MEMORY:
+        return _journal()
 
     return None  # not ours — caller handles
 
@@ -207,3 +218,80 @@ def _set_approval(subsystem: str, rest: List[str], set_mode_fn) -> str:
     except Exception as e:
         return f"Failed to set {subsystem}.write_approval: {e}"
     return f"{subsystem}.write_approval set to '{'on' if enabled else 'off'}'."
+
+
+# ---------------------------------------------------------------------------
+# Journal / eviction / migration handlers (memory only)
+# ---------------------------------------------------------------------------
+
+
+def _truncate_line(text: str, max_len: int = 120) -> str:
+    """Truncate a line for chat-bubble display."""
+    if len(text) <= max_len:
+        return text
+    return text[:max_len - 3] + "..."
+
+
+def _migrate() -> str:
+    """Run legacy-to-SQLite pending migration."""
+    result = mpm.migrate_legacy_pending()
+    migrated = len(result.get("migrated", []))
+    failed = len(result.get("failed", []))
+    if migrated == 0 and failed == 0:
+        return "Legacy migration: nothing to migrate (no legacy files found)."
+    out = [f"Legacy migration: {migrated} file(s) imported."]
+    if failed:
+        out.append(f"{failed} file(s) failed (will retry on next run):")
+        for f in result["failed"][:5]:
+            out.append(f"  - {f.get('file', '?')}")
+        if len(result["failed"]) > 5:
+            out.append(f"  ... and {len(result['failed']) - 5} more")
+    return "\n".join(out)
+
+
+def _evicted() -> str:
+    """List dead-lettered and evicted entries (truncated for chat bubbles)."""
+    dead = pq.list_all(status=pq.STATUS_DEAD)
+    evicted = pq.list_evictions(limit=10)
+
+    lines = []
+    if dead:
+        lines.append(f"Dead-lettered ({len(dead)}):")
+        for r in dead[-10:]:
+            kind = r.get("kind", "?")
+            summary = str(r.get("summary") or r.get("payload", {}))
+            if isinstance(summary, dict):
+                summary = str(summary)[:80]
+            line = f"  {r.get('id', '?')}  {kind}  {summary[:80]}"
+            lines.append(_truncate_line(line))
+    else:
+        lines.append("Dead-lettered: 0")
+
+    if evicted:
+        lines.append(f"\nRecent evictions ({len(evicted)}):")
+        for r in evicted:
+            reason = str(r.get("reason") or "")[:80]
+            line = f"  {r.get('id', '?')}  {r.get('target', '?')}  {reason}"
+            lines.append(_truncate_line(line))
+    else:
+        lines.append("\nRecent evictions: 0")
+
+    return "\n".join(lines)
+
+
+def _journal() -> str:
+    """Show projection journal status summary."""
+    status = mp.get_status()
+    lines = [
+        "Memory journal status:",
+        f"  Active: {status['active_count']}",
+        f"  Pending: {status['pending_count']}",
+        f"  Processing: {status['processing_count']}",
+        f"  Failed: {status['failed_count']}",
+        f"  Dead-lettered: {status['dead_letter_count']}",
+        f"  Oldest age: {status['oldest_age_seconds']:.0f}s",
+        f"  Behind: {'yes' if status['behind'] else 'no'}",
+    ]
+    if status.get("last_error"):
+        lines.append(f"  Last error: {_truncate_line(str(status['last_error']), 120)}")
+    return "\n".join(lines)

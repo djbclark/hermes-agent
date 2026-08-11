@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hermes_constants import get_hermes_home
+from tools import memory_pending_queue as _pq
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +112,26 @@ def _pending_dir(subsystem: str) -> Path:
     return get_hermes_home() / "pending" / subsystem
 
 
+def _pq_record_to_pending(record: Dict[str, Any], subsystem: str) -> Dict[str, Any]:
+    """Convert a pq journal record dict to the expected pending-record shape.
+
+    The journal stores ``payload`` as a JSON string; `_pq`'s `_row_to_record`
+    already parses it back to a dict for us.  We reshape the top-level keys
+    to match what callers of ``stage_write`` / ``list_pending`` expect:
+    ``id``, ``subsystem``, ``action``, ``summary``, ``origin``, ``created_at``,
+    ``payload``.
+    """
+    return {
+        "id": record.get("id", ""),
+        "subsystem": subsystem,
+        "action": record.get("action", ""),
+        "summary": record.get("summary", ""),
+        "origin": record.get("origin", "foreground"),
+        "created_at": record.get("created_at", time.time()),
+        "payload": record.get("payload", {}),
+    }
+
+
 def stage_write(subsystem: str, payload: Dict[str, Any],
                 *, summary: str, origin: str) -> Dict[str, Any]:
     """Persist a pending write and return a short record describing it.
@@ -129,6 +150,33 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
     logs and still returns a record (the write is simply lost, which is the
     safe failure for an approval gate — nothing is silently committed).
     """
+    if subsystem == MEMORY:
+        try:
+            pq_record = _pq.enqueue(
+                kind=_pq.KIND_APPROVAL,
+                action=payload.get("action", ""),
+                target=payload.get("target", ""),
+                payload=payload,
+                summary=summary,
+                origin=origin,
+            )
+            return _pq_record_to_pending(pq_record, subsystem)
+        except Exception as e:  # pragma: no cover - disk / cap failure path
+            logger.error(
+                "Failed to stage pending %s write via journal: %s",
+                subsystem, e, exc_info=True,
+            )
+            return {
+                "id": uuid.uuid4().hex[:8],
+                "subsystem": subsystem,
+                "action": payload.get("action", ""),
+                "summary": (summary or "").strip(),
+                "origin": origin or "foreground",
+                "created_at": time.time(),
+                "payload": payload,
+            }
+
+    # SKILLS — legacy JSON path (unchanged)
     pid = uuid.uuid4().hex[:8]
     record = {
         "id": pid,
@@ -153,6 +201,12 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
 
 def list_pending(subsystem: str) -> List[Dict[str, Any]]:
     """Return all pending records for ``subsystem``, oldest first."""
+    if subsystem == MEMORY:
+        records = _pq.list_active(kind=_pq.KIND_APPROVAL)
+        records.sort(key=lambda r: r.get("created_at", 0))
+        return [_pq_record_to_pending(r, subsystem) for r in records]
+
+    # SKILLS — legacy JSON path (unchanged)
     d = _pending_dir(subsystem)
     if not d.exists():
         return []
@@ -168,6 +222,13 @@ def list_pending(subsystem: str) -> List[Dict[str, Any]]:
 
 def get_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
     """Return a single pending record by id, or None."""
+    if subsystem == MEMORY:
+        record = _pq.get(pending_id)
+        if record is not None and record.get("kind") == _pq.KIND_APPROVAL:
+            return _pq_record_to_pending(record, subsystem)
+        return None
+
+    # SKILLS — legacy JSON path (unchanged)
     path = _pending_dir(subsystem) / f"{pending_id}.json"
     if not path.exists():
         return None
@@ -179,6 +240,10 @@ def get_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
 
 def discard_pending(subsystem: str, pending_id: str) -> bool:
     """Delete a pending record. Returns True if it existed."""
+    if subsystem == MEMORY:
+        return _pq.discard(pending_id, reason="discarded by user")
+
+    # SKILLS — legacy JSON path (unchanged)
     path = _pending_dir(subsystem) / f"{pending_id}.json"
     try:
         if path.exists():
@@ -191,6 +256,10 @@ def discard_pending(subsystem: str, pending_id: str) -> bool:
 
 def pending_count(subsystem: str) -> int:
     """Cheap count of pending records (for notification badges)."""
+    if subsystem == MEMORY:
+        return _pq.count_active(kind=_pq.KIND_APPROVAL)
+
+    # SKILLS — legacy JSON path (unchanged)
     d = _pending_dir(subsystem)
     if not d.exists():
         return 0
