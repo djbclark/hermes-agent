@@ -999,3 +999,168 @@ class TestNotFoundCache:
         assert _check_not_found_cache("read", "/tmp/never-exists-notify", tid) is None, (
             "notify_other_tool_call must clear cached misses"
         )
+
+
+class TestTruncationPlaceholderGuard:
+    """Regression tests for #83714 — the ``patch``/``write_file`` tools must
+    refuse to persist a truncation-placeholder marker (e.g. ``...[truncated]``)
+    instead of writing it literally into the target file.
+    """
+
+    def test_find_truncation_placeholder_detects_known_markers(self):
+        from tools.file_tools import _find_truncation_placeholder
+
+        assert _find_truncation_placeholder("hello ...[truncated]") == "...[truncated]"
+        assert _find_truncation_placeholder("hello … [truncated] world")
+        assert _find_truncation_placeholder("plain [truncated] marker") == "[truncated]"
+        assert _find_truncation_placeholder("// ... unchanged ...\ndef f(): pass")
+        assert _find_truncation_placeholder("# ... rest of file ...\npass")
+        assert "HERMES-CONTEXT-COMPRESSION" in (
+            _find_truncation_placeholder(
+                "x" * 10
+                + "⟪HERMES-CONTEXT-COMPRESSION: 1 of 2 chars omitted here "
+                + "by Hermes's context compressor. This is NOT part of the original tool "
+                + "call and must never be reproduced in new output — always write full, "
+                + "untruncated content.⟫"
+            )
+            or ""
+        )
+        assert _find_truncation_placeholder("normal content, nothing odd here") is None
+        assert _find_truncation_placeholder("") is None
+        assert _find_truncation_placeholder(None) is None
+
+    def test_find_truncation_placeholder_count_based_vs_original(self):
+        """#68512: pre-existing one occurrence is ok; adding a second is not."""
+        from tools.file_tools import _find_truncation_placeholder
+
+        original = "def foo():\n    // ... unchanged ...\n    pass\n"
+        same = original + "def bar():\n    return 1\n"
+        assert _find_truncation_placeholder(same, original) is None
+        doubled = original + "def bar():\n    // ... unchanged ...\n    pass\n"
+        assert _find_truncation_placeholder(doubled, original) is not None
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_write_file_rejects_truncation_placeholder(self, mock_get):
+        from tools.file_tools import write_file_tool
+
+        content = "line one\nline two\n...[truncated]\nline four\n"
+        result = json.loads(write_file_tool("/tmp/corrupt.py", content))
+
+        assert "error" in result
+        assert "truncation placeholder" in result["error"].lower()
+        mock_get.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_patch_replace_rejects_truncation_placeholder_in_new_string(self, mock_get):
+        from tools.file_tools import patch_tool
+
+        result = json.loads(patch_tool(
+            mode="replace",
+            path="/tmp/f.py",
+            old_string="def foo():\n    pass\n",
+            new_string="def foo():\n    do_thing()\n...[truncated]\n",
+        ))
+
+        assert "error" in result
+        assert "truncation placeholder" in result["error"].lower()
+        mock_get.return_value.patch_replace.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_patch_replace_allows_marker_already_present_in_old_string(self, mock_get):
+        """A legitimate edit to text that already mentions the marker (e.g.
+        this very test file, or docs about the bug) must not be blocked —
+        only NEW occurrences introduced by new_string are suspicious."""
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {"status": "ok"}
+        mock_ops.patch_replace.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import patch_tool
+        marker_text = "marker = '...[truncated]'\n"
+        result = json.loads(patch_tool(
+            mode="replace",
+            path="/tmp/f.py",
+            old_string=marker_text,
+            new_string="marker = '...[truncated]'  # renamed\n",
+        ))
+        assert result["status"] == "ok"
+        mock_ops.patch_replace.assert_called_once()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_patch_v4a_rejects_truncation_placeholder_in_added_line(self, mock_get):
+        from tools.file_tools import patch_tool
+
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Update File: /tmp/f.py\n"
+            "@@ def foo():\n"
+            "-    pass\n"
+            "+    do_thing()\n"
+            "+    ...[truncated]\n"
+            "*** End Patch\n"
+        )
+        result = json.loads(patch_tool(mode="patch", patch=patch_text))
+
+        assert "error" in result
+        assert "truncation placeholder" in result["error"].lower()
+        mock_get.return_value.patch_v4a.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_patch_v4a_allows_marker_on_removed_or_context_line(self, mock_get):
+        """The marker must only be checked against ADDED content — a patch
+        that removes a line containing it, or merely has it as unchanged
+        context, is not the model truncating its own output."""
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {"status": "ok"}
+        mock_ops.patch_v4a.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import patch_tool
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Update File: /tmp/f.py\n"
+            "@@ def foo():\n"
+            " marker = '...[truncated]'\n"
+            "-    old_call()\n"
+            "+    new_call()\n"
+            "*** End Patch\n"
+        )
+        result = json.loads(patch_tool(mode="patch", patch=patch_text))
+        assert result["status"] == "ok"
+        mock_ops.patch_v4a.assert_called_once()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_patch_v4a_add_file_rejects_truncation_placeholder(self, mock_get):
+        from tools.file_tools import patch_tool
+
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Add File: /tmp/new_module.py\n"
+            "+def foo():\n"
+            "+    ...[truncated]\n"
+            "*** End Patch\n"
+        )
+        result = json.loads(patch_tool(mode="patch", patch=patch_text))
+
+        assert "error" in result
+        assert "truncation placeholder" in result["error"].lower()
+        mock_get.return_value.patch_v4a.assert_not_called()
+
+    def test_extract_v4a_added_content_falls_back_to_raw_text_on_parse_failure(self):
+        from tools.file_tools import _extract_v4a_added_content
+
+        garbage = "not a real v4a patch at all"
+        assert _extract_v4a_added_content(garbage) == garbage
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_write_file_rejects_hermes_compression_marker(self, mock_get):
+        from tools.file_tools import write_file_tool
+        from tools.truncation_markers import format_compression_marker
+
+        content = "line one\n" + format_compression_marker(omitted=100, total=300) + "\n"
+        result = json.loads(write_file_tool("/tmp/corrupt.py", content))
+        assert "error" in result
+        assert "truncation placeholder" in result["error"].lower()
+        mock_get.assert_not_called()

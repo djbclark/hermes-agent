@@ -1148,6 +1148,15 @@ def _strip_image_parts_from_parts(parts: Any) -> Any:
     return out if had_image else None
 
 
+# #83714 — shrunk tool-call args are replayed as the model's OWN past output.
+# Marker text lives in tools.truncation_markers so the write/patch guard can
+# refuse the same token if a model ever copies it (#83752 / #83843).
+from tools.truncation_markers import (
+    COMPRESSION_MARKER_TEMPLATE as _COMPRESSION_MARKER_TEMPLATE,
+    format_compression_marker as _format_compression_marker,
+)
+
+
 def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
     """Shrink long string values inside a tool-call arguments JSON blob while
     preserving JSON validity.
@@ -1172,6 +1181,12 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
     to begin with — some model backends use non-JSON tool arguments — the
     original string is returned unchanged rather than replaced with
     something neither we nor the backend can parse.
+
+    The shrunk value stays a plain string (never a nested object) so the
+    JSON *shape* is unchanged from the original — only #83714's marker text
+    changed, not the #11762 valid-JSON-and-matching-shape contract. See
+    ``_COMPRESSION_MARKER_TEMPLATE`` for why the marker itself looks nothing
+    like ``"...[truncated]"`` anymore.
     """
     try:
         parsed = json.loads(args)
@@ -1181,7 +1196,10 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
     def _shrink(obj: Any) -> Any:
         if isinstance(obj, str):
             if len(obj) > head_chars:
-                return obj[:head_chars] + "...[truncated]"
+                marker = _format_compression_marker(
+                    omitted=len(obj) - head_chars, total=len(obj)
+                )
+                return obj[:head_chars] + marker
             return obj
         if isinstance(obj, dict):
             return {k: _shrink(v) for k, v in obj.items()}

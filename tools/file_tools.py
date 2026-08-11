@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import posixpath
+import re
 import sys
 import threading
 from pathlib import Path, PurePosixPath
@@ -1332,6 +1333,50 @@ def _is_internal_file_tool_content(content: str) -> bool:
     )
 
 
+# #83714 / #68512 / #83843 — refuse AI truncation placeholders and Hermes
+# compressor markers on the write path. Detection lives in
+# tools.truncation_markers (shared with the context compressor) and uses
+# count-based comparison when an original baseline is available so
+# pre-existing docs/tests that mention markers are not blocked, but adding
+# a NEW occurrence still is.
+from tools.truncation_markers import find_new_truncation_placeholder as _find_truncation_placeholder
+
+
+def _extract_v4a_added_content(patch_content: str) -> str:
+    """Return only the text a V4A patch is ADDING: '+' hunk lines and full
+    Add-File bodies. Falls back to the raw patch text if it fails to parse
+    so detection degrades gracefully instead of silently skipping — a
+    malformed patch is exactly the kind of thing worth double-checking.
+    """
+    try:
+        from tools.patch_parser import parse_v4a_patch, OperationType
+        operations, parse_error = parse_v4a_patch(patch_content)
+        if parse_error or not operations:
+            return patch_content
+        chunks: list[str] = []
+        for op in operations:
+            if op.operation == OperationType.ADD and op.content:
+                chunks.append(op.content)
+            for hunk in op.hunks:
+                for line in hunk.lines:
+                    if line.prefix == '+':
+                        chunks.append(line.content)
+        return "\n".join(chunks)
+    except Exception:
+        return patch_content
+
+
+def _truncation_placeholder_error(where: str, marker: str) -> str:
+    return (
+        f"Refusing to write {where}: it contains what looks like a "
+        f"truncation placeholder ({marker!r}) instead of the actual "
+        "content. This usually means the content was abbreviated rather "
+        "than written out in full. Emit the complete text with no "
+        "'...[truncated]'-style markers, then retry. The file was NOT "
+        "modified."
+    )
+
+
 def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     """Get or create ShellFileOperations for a terminal environment.
 
@@ -2127,6 +2172,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             "Strip read_file line-number prefixes or reconstruct the intended "
             "file contents before writing."
         )
+    _placeholder = _find_truncation_placeholder(content)
+    if _placeholder:
+        return tool_error(_truncation_placeholder_error(f"{path!r}", _placeholder))
     try:
         # Resolve once for the registry lock + stale check.  Failures here
         # fall back to the legacy path — write proceeds, per-task staleness
@@ -2304,6 +2352,14 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     return tool_error("path required")
                 if old_string is None or new_string is None:
                     return tool_error("old_string and new_string required")
+                # #83714 / #68512 — count-based: only flag markers that are
+                # NEW relative to old_string (adding a second truncated stub
+                # still fails even if one already existed).
+                _placeholder = _find_truncation_placeholder(new_string, old_string)
+                if _placeholder:
+                    return tool_error(
+                        _truncation_placeholder_error("new_string", _placeholder)
+                    )
                 # Pass the resolved ABSOLUTE path to the shell layer so it
                 # operates on the exact file the tool layer resolved — the
                 # shell's own cwd may differ (worktree-cwd bug), and a relative
@@ -2314,6 +2370,17 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
+                # #83714 — scan only the content the model is actually ADDING
+                # (V4A '+' hunk lines and full Add-File bodies), not the whole
+                # patch text. Scanning the whole patch would false-positive on
+                # a legitimate edit that removes, or merely anchors context
+                # on, a pre-existing placeholder-like literal.
+                _added = _extract_v4a_added_content(patch)
+                _placeholder = _find_truncation_placeholder(_added)
+                if _placeholder:
+                    return tool_error(
+                        _truncation_placeholder_error("patch content", _placeholder)
+                    )
                 # Rewrite V4A headers to the resolved absolute paths so the
                 # shell layer patches the exact files the tool layer resolved
                 # (locked/reported). Without this a relative header re-resolves
