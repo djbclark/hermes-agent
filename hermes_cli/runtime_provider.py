@@ -1135,6 +1135,13 @@ def _resolve_named_custom_runtime(
         # credentials. NEVER log the values.
         if custom_provider.get("extra_headers"):
             pool_result["extra_headers"] = dict(custom_provider["extra_headers"])
+        if (
+            pool_result.get("api_key")
+            and base_url_host_matches(base_url, "opencode.ai")
+            and "/zen/v1" in base_url.lower()
+            and "/zen/go/" not in base_url.lower()
+        ):
+            pool_result.setdefault("extra_headers", {})["x-api-key"] = pool_result["api_key"]
         return pool_result
 
     _cp_is_openai_url   = base_url_host_matches(base_url, "openai.com") or base_url_host_matches(base_url, "openai.azure.com")
@@ -1170,8 +1177,21 @@ def _resolve_named_custom_runtime(
         result["max_output_tokens"] = custom_provider["max_output_tokens"]
     # Per-provider extra HTTP headers (proxies, gateways, custom auth).
     # Values may carry credentials — NEVER log them.
-    if custom_provider.get("extra_headers"):
-        result["extra_headers"] = dict(custom_provider["extra_headers"])
+    extra_headers = dict(custom_provider.get("extra_headers") or {})
+    # OpenCode Zen's OpenAI-compatible endpoint requires x-api-key rather
+    # than Authorization: Bearer. Named custom aliases (such as the local
+    # opencode-zen-free free-model lane) otherwise resolve successfully but
+    # every fallback request gets HTTP 401. Keep this scoped to Zen, not Go:
+    # OpenCode Go accepts the normal Bearer header.
+    if (
+        api_key
+        and base_url_host_matches(base_url, "opencode.ai")
+        and "/zen/v1" in base_url.lower()
+        and "/zen/go/" not in base_url.lower()
+    ):
+        extra_headers.setdefault("x-api-key", api_key)
+    if extra_headers:
+        result["extra_headers"] = extra_headers
     request_overrides = _custom_provider_request_overrides(custom_provider)
     if request_overrides:
         result["request_overrides"] = request_overrides
