@@ -594,11 +594,18 @@ class GatewaySlashCommandsMixin:
             except Exception:
                 db_total_tokens = 0
 
-        # Resolve model/context for cockpit-style status. Prefer the live or
-        # cached agent because it carries the actual runtime route and context
-        # compressor. Fall back to persisted SessionDB metadata plus the
-        # SessionStore's last_prompt_tokens so /status remains useful between
-        # turns without making billing/account calls.
+        latest_usage: dict[str, Any] = {}
+        try:
+            usage = await self._session_db.get_latest_session_model_usage(session_entry.session_id)
+            if isinstance(usage, dict):
+                latest_usage = usage
+        except Exception:
+            latest_usage = {}
+
+        # Resolve model/context for cockpit-style status. A live agent carries the
+        # active route. Between turns, prefer the latest per-call usage route over
+        # the aggregate sessions row or cached agent: the aggregate row can retain
+        # stale billing metadata after a provider switch.
         status_agent = agent if is_running else None
         if status_agent is None:
             cache_lock = getattr(self, "_agent_cache_lock", None)
@@ -625,6 +632,11 @@ class GatewaySlashCommandsMixin:
             if ctx is not None:
                 context_used = _int_value(getattr(ctx, "last_prompt_tokens", 0))
                 context_total = _int_value(getattr(ctx, "context_length", 0))
+
+        if not is_running and latest_usage:
+            model_name = _clean_str(latest_usage.get("model")) or model_name
+            provider_name = _clean_str(latest_usage.get("billing_provider")) or provider_name
+            base_url = _clean_str(latest_usage.get("billing_base_url")) or base_url
 
         model_name = model_name or _clean_str(session_row.get("model"))
         provider_name = provider_name or _clean_str(session_row.get("billing_provider"))

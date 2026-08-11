@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
-from gateway.restart import GATEWAY_FATAL_CONFIG_EXIT_CODE
+from gateway.restart import GATEWAY_FATAL_CONFIG_EXIT_CODE, should_restart_after_signal
 from gateway.run import GatewayRunner
 from gateway.status import read_runtime_status
 
@@ -33,6 +33,18 @@ class _RetryableFailureAdapter(BasePlatformAdapter):
 class _DisabledAdapter(BasePlatformAdapter):
     def __init__(self):
         super().__init__(PlatformConfig(enabled=False, token="***"), Platform.TELEGRAM)
+
+
+def test_signal_shutdown_is_clean_under_launchd():
+    assert should_restart_after_signal({"XPC_SERVICE_NAME": "ai.hermes.gateway"}) is False
+
+
+def test_signal_shutdown_restarts_under_systemd():
+    assert should_restart_after_signal({"INVOCATION_ID": "test"}) is True
+
+
+def test_signal_shutdown_preserves_manual_supervisor_behavior():
+    assert should_restart_after_signal({}) is True
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         raise AssertionError("connect should not be called for disabled platforms")

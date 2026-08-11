@@ -1721,6 +1721,7 @@ def switch_model(
                     explicit_api_key=_ukey or None,
                     explicit_base_url=_user_pdef.base_url,
                     target_model=new_model,
+                    allow_paid_opencode_zen=bool(explicit_provider),
                 )
                 api_key = runtime.get("api_key", "") or _ukey
                 base_url = runtime.get("base_url", "") or _user_pdef.base_url
@@ -1738,6 +1739,7 @@ def switch_model(
                 runtime = resolve_runtime_provider(
                     requested=target_provider,
                     target_model=new_model,
+                    allow_paid_opencode_zen=bool(explicit_provider),
                 )
                 api_key = runtime.get("api_key", "")
                 base_url = runtime.get("base_url", "")

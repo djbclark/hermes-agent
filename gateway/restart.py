@@ -54,6 +54,27 @@ def is_gateway_supervisor_process(
     }
 
 
+def should_restart_after_signal(environ: Mapping[str, str] | None = None) -> bool:
+    """Return whether a signal shutdown should use a non-zero exit code.
+
+    systemd uses ``Restart=on-failure`` and therefore needs a non-zero exit to
+    revive an unexpectedly interrupted gateway. macOS launchd jobs normally
+    use ``KeepAlive`` and can be booted out after repeated non-zero exits;
+    returning success there prevents the SIGTERM/respawn crash loop described
+    in the 2026-08-08 RCA. Other supervisors retain the conservative restart
+    behavior used before this distinction existed.
+    """
+    env = os.environ if environ is None else environ
+    if env.get("INVOCATION_ID") or env.get("JOURNAL_STREAM"):
+        return True
+    if str(env.get("XPC_SERVICE_NAME", "")).strip() not in {"", "0"}:
+        return False
+    return str(env.get(EXTERNAL_GATEWAY_SUPERVISOR_ENV, "")).strip().lower() not in {
+        "launchd",
+        "macos",
+    }
+
+
 def is_container_restart_context() -> bool:
     """Return whether the gateway is running inside a container for restart
     routing purposes (Docker/Podman ⇒ the detached setsid path dies with the

@@ -318,6 +318,13 @@ class TestLaunchdServiceRecovery:
         assert gateway_cli._wait_for_pid_exit(0, timeout=30) is True
 
 
+    def test_launchd_plist_omits_replace_flag(self):
+        """launchd must not run gateway takeover logic on every respawn."""
+        plist = gateway_cli.generate_launchd_plist()
+        assert "<string>gateway</string>" in plist
+        assert "<string>run</string>" in plist
+        assert "<string>--replace</string>" not in plist
+
 
     def test_refresh_defers_reload_when_running_inside_gateway_tree(self, tmp_path, monkeypatch):
         """#43842: when the refresh runs inside the gateway's own process tree,
@@ -332,7 +339,7 @@ class TestLaunchdServiceRecovery:
             gateway_cli,
             "generate_launchd_plist",
             lambda: (
-                "<plist>--replace\n<key>HERMES_HOME</key>"
+                "<plist>\n<key>HERMES_HOME</key>"
                 "<string>/Users/alice/.hermes</string></plist>"
             ),
         )
@@ -362,7 +369,7 @@ class TestLaunchdServiceRecovery:
 
         assert result is True
         # The new plist was written.
-        assert "--replace" in plist_path.read_text(encoding="utf-8")
+        assert "--replace" not in plist_path.read_text(encoding="utf-8")
         # No DIRECT bootout/bootstrap ran (those would kill us mid-sequence).
         assert not [c for c in run_calls if "bootout" in c or "bootstrap" in c]
         # Exactly one Popen call was made for the transient launchd job.

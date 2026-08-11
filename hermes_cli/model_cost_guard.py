@@ -54,6 +54,40 @@ def _pricing_from_model_info(
     )
 
 
+def is_free_model(model_name: str, *, provider: str = "", model_info: Optional[ModelInfo] = None) -> bool:
+    """Return whether a model is verified zero-cost by models.dev.
+
+    Unknown pricing is not treated as free; callers enforcing a no-spend policy
+    must fail closed.
+    """
+    if provider.strip().lower() not in {"opencode-zen", "opencode"}:
+        return False
+    info = model_info
+    if info is None:
+        try:
+            from agent.models_dev import get_model_info
+            info = get_model_info("opencode", model_name)
+        except Exception:
+            info = None
+    if info is None or not info.has_cost_data():
+        return False
+    costs = (info.cost_input, info.cost_output, info.cost_cache_read, info.cost_cache_write)
+    try:
+        return all(Decimal(str(value or 0)) == 0 for value in costs)
+    except (InvalidOperation, ValueError, TypeError):
+        return False
+
+
+def opencode_zen_policy_error(model_name: str, *, model_info: Optional[ModelInfo] = None) -> str:
+    """Explain why a non-free OpenCode Zen model was blocked."""
+    return (
+        f"OpenCode Zen model '{model_name}' is blocked by Hermes' free-only policy. "
+        "Use a model whose models.dev pricing is zero, explicitly select the "
+        "provider with /model ... --provider opencode-zen, or set "
+        "model.allow_paid_opencode_zen: true to override."
+    )
+
+
 def expensive_model_warning(
     model_name: str,
     *,

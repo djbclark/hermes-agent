@@ -142,6 +142,43 @@ async def test_status_command_includes_live_agent_model_and_context():
 
 
 @pytest.mark.asyncio
+async def test_status_prefers_latest_usage_route_over_stale_session_metadata_and_cache():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-stale",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner._session_db._db.get_session.return_value = {
+        "model": "gpt-5.6-luna",
+        "billing_provider": "opencode-zen",
+        "billing_base_url": "https://opencode.ai/zen/v1/",
+        "input_tokens": 1,
+        "output_tokens": 1,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+    }
+    runner._session_db._db.get_latest_session_model_usage.return_value = {
+        "model": "gpt-5.6-luna",
+        "billing_provider": "openai-codex",
+        "billing_base_url": "https://chatgpt.com/backend-api/codex",
+    }
+    key = build_session_key(_make_source())
+    runner._agent_cache[key] = (SimpleNamespace(
+        model="gpt-5.6-luna", provider="opencode-zen", base_url="https://opencode.ai/zen/v1/"
+    ), None)
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "**Model:** `gpt-5.6-luna` (openai-codex)" in result
+    assert "(opencode-zen)" not in result
+
+
+@pytest.mark.asyncio
 async def test_agents_command_reports_active_agents_and_processes(monkeypatch):
     session_key = build_session_key(_make_source())
     session_entry = SessionEntry(

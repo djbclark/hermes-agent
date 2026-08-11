@@ -2488,6 +2488,7 @@ from gateway.restart import (
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
     parse_restart_after_turn_timeout,
     parse_restart_drain_timeout,
+    should_restart_after_signal,
 )
 
 
@@ -28069,9 +28070,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # `hermes gateway stop` and interactive Ctrl+C are handled above as
     # planned stops and should not trigger service-manager revival.
     if _signal_initiated_shutdown and not runner._restart_requested:
+        if not should_restart_after_signal():
+            logger.info(
+                "Signal-initiated shutdown without restart request under launchd; "
+                "exiting cleanly to avoid a non-zero respawn loop."
+            )
+            return True
         logger.info(
             "Exiting with code 1 (signal-initiated shutdown without restart "
-            "request) so systemd Restart=on-failure can revive the gateway."
+            "request) so the service supervisor can revive the gateway."
         )
         return False  # → sys.exit(1) in the caller
 

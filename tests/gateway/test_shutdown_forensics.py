@@ -55,6 +55,17 @@ class TestSnapshotShutdownContext:
         ctx = sf.snapshot_shutdown_context(signal.SIGTERM)
         assert ctx["under_systemd"] is False
 
+    def test_macos_launchd_is_not_reported_as_systemd(self, monkeypatch):
+        monkeypatch.setattr(sf.sys, "platform", "darwin")
+        monkeypatch.setattr(sf.os, "getppid", lambda: 1)
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+        monkeypatch.delenv("JOURNAL_STREAM", raising=False)
+        monkeypatch.setenv("XPC_SERVICE_NAME", "ai.hermes.gateway")
+        ctx = sf.snapshot_shutdown_context(signal.SIGTERM)
+        assert ctx["supervisor"] == "launchd"
+        assert ctx["under_systemd"] is False
+        assert "supervisor=launchd" in sf.format_context_for_log(ctx)
+
 
     def test_detects_takeover_marker_for_self(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

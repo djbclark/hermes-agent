@@ -6447,6 +6447,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             row = cursor.fetchone()
         return self._session_row_dict(row) if row else None
 
+    def get_latest_session_model_usage(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return the most recently observed model/provider route for a session.
+
+        The aggregate ``sessions`` row can retain stale billing metadata after a
+        provider switch; ``session_model_usage.last_seen`` records the route that
+        actually handled the latest API call.
+        """
+        self.flush_token_counts()
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                """SELECT model, billing_provider, billing_base_url, billing_mode,
+                          last_seen
+                   FROM session_model_usage
+                   WHERE session_id = ?
+                   ORDER BY last_seen DESC
+                   LIMIT 1""",
+                (session_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
 

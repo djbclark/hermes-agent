@@ -1668,6 +1668,7 @@ def resolve_runtime_provider(
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
     target_model: Optional[str] = None,
+    allow_paid_opencode_zen: bool = False,
 ) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution.
 
@@ -1693,6 +1694,15 @@ def resolve_runtime_provider(
     # the next provider instead of using a disabled one.
     from hermes_cli.config import is_provider_enabled, load_config
     _full_cfg = load_config()
+    if requested_provider == "opencode-zen" and not allow_paid_opencode_zen:
+        _model_cfg = _full_cfg.get("model") if isinstance(_full_cfg, dict) else {}
+        _model_cfg = _model_cfg if isinstance(_model_cfg, dict) else {}
+        _target = target_model or str(_model_cfg.get("default") or "").strip()
+        _config_override = bool(_model_cfg.get("allow_paid_opencode_zen", False))
+        if not _config_override:
+            from hermes_cli.model_cost_guard import is_free_model, opencode_zen_policy_error
+            if not is_free_model(_target, provider="opencode-zen"):
+                raise ValueError(opencode_zen_policy_error(_target))
     _provs_cfg = _full_cfg.get("providers") if isinstance(_full_cfg, dict) else None
     if isinstance(_provs_cfg, dict):
         _block = _provs_cfg.get(requested_provider)
