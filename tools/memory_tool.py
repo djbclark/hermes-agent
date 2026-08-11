@@ -67,6 +67,14 @@ MEMORY_BLOCK_HEADERS = {
 ENTRY_DELIMITER = "\n§\n"
 
 
+PIN_MARKER = "[pinned]"
+
+
+def is_pinned(entry: str) -> bool:
+    """Return whether an entry is explicitly protected from projection eviction."""
+    return entry.strip().lower().startswith(PIN_MARKER)
+
+
 # ---------------------------------------------------------------------------
 # Memory content scanning — lightweight check for injection/exfiltration
 # in content that gets injected into the system prompt.
@@ -667,6 +675,154 @@ class MemoryStore:
             self.save_to_disk(target)
 
         return self._success_response(target, f"Applied {len(operations)} operation(s).")
+
+    def apply_with_capacity(self, target: str, operations: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Apply add/replace/remove operations, evicting to make room instead
+        of queuing an overflow for later review.
+
+        This is the projection consumer's entry point (see
+        ``tools/memory_projection.py``) for replaying a journal record that
+        already survived the normal write gate/threat scan once (at enqueue
+        time) -- it must not go through :meth:`add`/:meth:`replace` and their
+        auto-queue-on-overflow behavior, or applying a queued record would
+        just enqueue a duplicate of itself. Callers other than the projection
+        consumer should use :meth:`add`/:meth:`replace`/:meth:`remove`/
+        :meth:`apply_batch` instead.
+
+        Validation and content scanning mirror :meth:`apply_batch` exactly
+        (same op semantics, same all-or-nothing intent for malformed input).
+        The one behavioral difference is what happens when the final result
+        would exceed the char limit: instead of durably queuing the whole
+        batch, this evicts existing entries to make room, oldest first,
+        skipping:
+
+          * entries this SAME call is adding/replacing (protected -- eviction
+            must not undo the very write it's trying to land)
+          * pinned entries (see :func:`is_pinned`)
+
+        Returns the normal success/error shape plus, on success, an
+        ``"evicted"`` list of the entry texts that were dropped (empty if
+        none were needed). If eviction of every evictable entry still isn't
+        enough to fit, returns ``{"success": False, "unresolvable": True,
+        ...}`` -- the caller (the projection consumer) must dead-letter the
+        record rather than retry it, since retrying without operator
+        intervention (unpinning something, raising the limit) can never
+        succeed.
+        """
+        if not operations:
+            return {"success": False, "error": "operations list is empty."}
+
+        for i, op in enumerate(operations):
+            act = (op or {}).get("action")
+            new_content = (op or {}).get("content")
+            if act in {"add", "replace"} and new_content:
+                scan_error = _scan_memory_content(new_content)
+                if scan_error:
+                    return {"success": False, "error": f"Operation {i + 1}: {scan_error}"}
+
+        with self._file_lock(self._path_for(target)):
+            bak = self._reload_target(target)
+            if bak is _READ_FAILED:
+                return _read_failed_error(self._path_for(target))
+            if bak:
+                return _drift_error(self._path_for(target), bak)
+
+            working: List[str] = list(self._entries_for(target))
+            limit = self._char_limit(target)
+            # Indices into `working` this call itself wrote -- never evicted.
+            protected: set = set()
+
+            for i, op in enumerate(operations):
+                op = op or {}
+                act = op.get("action")
+                content = (op.get("content") or "").strip()
+                old_text = (op.get("old_text") or "").strip()
+                pos = f"Operation {i + 1} ({act or 'unknown'})"
+
+                if act == "add":
+                    if not content:
+                        return self._batch_error(target, f"{pos}: content is required.")
+                    if content in working:
+                        continue
+                    working.append(content)
+                    protected.add(len(working) - 1)
+
+                elif act == "replace":
+                    if not old_text:
+                        return self._batch_error(target, f"{pos}: old_text is required.")
+                    if not content:
+                        return self._batch_error(
+                            target,
+                            f"{pos}: content is required (use action='remove' to delete).",
+                        )
+                    matches = [j for j, e in enumerate(working) if old_text in e]
+                    if not matches:
+                        return self._batch_error(target, f"{pos}: no entry matched '{old_text}'.")
+                    if len({working[j] for j in matches}) > 1:
+                        return self._batch_error(
+                            target,
+                            f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific.",
+                        )
+                    idx = matches[0]
+                    working[idx] = content
+                    protected.add(idx)
+
+                elif act == "remove":
+                    if not old_text:
+                        return self._batch_error(target, f"{pos}: old_text is required.")
+                    matches = [j for j, e in enumerate(working) if old_text in e]
+                    if not matches:
+                        return self._batch_error(target, f"{pos}: no entry matched '{old_text}'.")
+                    if len({working[j] for j in matches}) > 1:
+                        return self._batch_error(
+                            target,
+                            f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific.",
+                        )
+                    idx = matches[0]
+                    working.pop(idx)
+                    protected = {j - 1 if j > idx else j for j in protected if j != idx}
+
+                else:
+                    return self._batch_error(
+                        target,
+                        f"{pos}: unknown action. Use add, replace, or remove.",
+                    )
+
+            def _total(entries: List[str]) -> int:
+                return len(ENTRY_DELIMITER.join(entries)) if entries else 0
+
+            evicted: List[str] = []
+            idx = 0
+            while _total(working) > limit and idx < len(working):
+                if idx in protected or is_pinned(working[idx]):
+                    idx += 1
+                    continue
+                evicted.append(working.pop(idx))
+                protected = {j - 1 if j > idx else j for j in protected}
+                # Deliberately do not advance idx -- the list shifted left.
+
+            if _total(working) > limit:
+                current = self._char_count(target)
+                return {
+                    "success": False,
+                    "unresolvable": True,
+                    "error": (
+                        f"Cannot make room in {target}: even after evicting every "
+                        f"evictable (unpinned, untouched) entry, the result "
+                        f"({_total(working):,} chars) still exceeds the "
+                        f"{limit:,}-char limit. Unpin/shorten entries or raise "
+                        f"the limit."
+                    ),
+                    "current_entries": self._entries_for(target),
+                    "usage": f"{current:,}/{limit:,}",
+                }
+
+            self._set_entries(target, working)
+            self.save_to_disk(target)
+
+        resp = self._success_response(target, f"Applied {len(operations)} operation(s).")
+        resp["evicted"] = evicted
+        return resp
 
     def _batch_error(self, target: str, message: str) -> Dict[str, Any]:
         """Build a batch-abort error that reports live (uncommitted) state."""
