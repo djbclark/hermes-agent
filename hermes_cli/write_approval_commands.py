@@ -16,12 +16,17 @@ platform the gateway truncates it and points the user at the dashboard / file.
 from __future__ import annotations
 
 import json
+import logging
+from pathlib import Path
 from typing import List, Optional
 
 from tools import memory_pending_queue as pq
 from tools import memory_pending_migration as mpm
 from tools import memory_projection as mp
 from tools import write_approval as wa
+from tools.memory_tool import get_memory_dir
+
+logger = logging.getLogger(__name__)
 
 
 def _fmt_state(subsystem: str) -> str:
@@ -99,13 +104,15 @@ def handle_pending_subcommand(
     if sub in {"approval", "mode"}:  # 'mode' kept as a back-compat alias
         return _set_approval(subsystem, rest, set_mode_fn)
 
-    # -- journal / eviction / migration (memory only) --
+    # -- journal / eviction / migration / fallback (memory only) --
     if sub == "migrate" and subsystem == wa.MEMORY:
         return _migrate()
     if sub == "evicted" and subsystem == wa.MEMORY:
         return _evicted()
     if sub == "journal" and subsystem == wa.MEMORY:
         return _journal()
+    if sub == "import-fallback" and subsystem == wa.MEMORY:
+        return _import_fallback()
 
     return None  # not ours — caller handles
 
@@ -282,6 +289,13 @@ def _evicted() -> str:
 def _journal() -> str:
     """Show projection journal status summary."""
     status = mp.get_status()
+    fallback = status.get("fallback")
+    if fallback is None:
+        try:
+            fallback_path = get_memory_dir() / "pending_fallback.jsonl"
+            fallback = fallback_path.exists() and fallback_path.stat().st_size > 0
+        except OSError:
+            fallback = False
     lines = [
         "Memory journal status:",
         f"  Active: {status['active_count']}",
@@ -291,7 +305,54 @@ def _journal() -> str:
         f"  Dead-lettered: {status['dead_letter_count']}",
         f"  Oldest age: {status['oldest_age_seconds']:.0f}s",
         f"  Behind: {'yes' if status['behind'] else 'no'}",
+        f"  Fallback: {'yes' if fallback else 'no'}",
     ]
     if status.get("last_error"):
         lines.append(f"  Last error: {_truncate_line(str(status['last_error']), 120)}")
     return "\n".join(lines)
+
+
+def _import_fallback() -> str:
+    """Import pending records from the fallback JSONL journal into SQLite."""
+    from pathlib import Path
+    import json
+    from tools import memory_pending_queue as pq
+    from tools.memory_tool import get_memory_dir
+
+    fallback = get_memory_dir() / "pending_fallback.jsonl"
+    if not fallback.exists():
+        return "No fallback journal found."
+
+    imported = 0
+    failed = 0
+    try:
+        with open(fallback, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                    # Re-enqueue into SQLite queue
+                    pq.enqueue(
+                        kind=pq.KIND_OVERFLOW,
+                        action=record.get("action"),
+                        target=record.get("target"),
+                        payload=record.get("payload"),
+                        summary=record.get("summary", "fallback import"),
+                        expected_previous_hash=record.get("expected_previous_hash"),
+                        origin="fallback_import",
+                    )
+                    imported += 1
+                except Exception as e:
+                    failed += 1
+                    logger.warning("Fallback import failed for line: %s", e)
+
+        # Rename the fallback file so we don't re-import on next run
+        if imported > 0:
+            fallback.rename(fallback.with_suffix(".jsonl.imported"))
+
+    except Exception as e:
+        return f"Fallback import failed: {e}"
+
+    return f"Imported {imported} fallback record(s) into SQLite queue" + (f", {failed} failed" if failed else ".")

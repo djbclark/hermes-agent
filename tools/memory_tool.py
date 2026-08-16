@@ -16,6 +16,22 @@ The snapshot refreshes on the next session start.
 Entry delimiter: § (section sign). Entries can be multiline.
 Character limits (not tokens) because char counts are model-independent.
 
+Capacity guard (Phase A): when a write would exceed the store's character limit,
+it is durably journaled to a SQLite pending-operation queue instead of being
+rejected. The agent receives a ``queued`` result with the operation ID rather
+than a ``success: false`` error, so it does not retry or lose the fact.
+
+  - WARN at 75 %  -- usage note is appended to success responses but the write
+                     still lands in the live store.
+  - JOURNAL at 85 % -- capacity-increasing writes are durably queued instead of
+                     applied directly; non-increasing writes (remove, shorter
+                     replace) still land live.
+  - PROJECT at ≤70 % -- the projection consumer's target after journaled entries
+                     are applied. Drain consolidates (merge/summarize CONTENT);
+                     it never deletes durable entries.
+  - Hysteresis: journal mode latches at QUEUE_PCT and stays latched while
+                usage is above TARGET_PCT and overflow work is still pending.
+
 Design:
 - Single `memory` tool with action parameter: add, replace, remove
 - replace/remove use short unique substring matching (not full text or IDs)
@@ -32,6 +48,20 @@ from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional, Tuple
 
 from utils import atomic_write_text
+
+# Capacity guard thresholds (Phase A):
+#   WARN_PCT  — include a usage note in success responses, write still lands.
+#   QUEUE_PCT — journal capacity-increasing writes to the pending queue instead
+#               of applying directly; non-increasing writes still land live.
+#   TARGET_PCT — drain / hysteresis low-water mark. Journal mode latches at
+#               QUEUE_PCT and stays latched until usage falls to TARGET_PCT.
+MEMORY_WARN_PCT = 75
+MEMORY_QUEUE_PCT = 85
+MEMORY_TARGET_PCT = 70
+
+# Never shrink an entry below this when consolidating. Emptying an entry would
+# be a delete; the drain is not allowed to delete durable facts.
+_MIN_CONSOLIDATED_ENTRY_CHARS = 32
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 msvcrt = None
@@ -71,8 +101,136 @@ PIN_MARKER = "[pinned]"
 
 
 def is_pinned(entry: str) -> bool:
-    """Return whether an entry is explicitly protected from projection eviction."""
+    """Return whether an entry is explicitly protected from projection rewrite."""
     return entry.strip().lower().startswith(PIN_MARKER)
+
+
+def target_char_budget(limit: int) -> int:
+    """Hysteresis low-water mark in characters for a store of *limit* chars."""
+    if limit <= 0:
+        return 0
+    return max(0, (limit * MEMORY_TARGET_PCT) // 100)
+
+
+def entries_char_total(entries: List[str]) -> int:
+    """Serialized character count of *entries*, matching on-disk layout."""
+    return len(ENTRY_DELIMITER.join(entries)) if entries else 0
+
+
+def _summarize_entry_text(text: str, max_chars: int) -> str:
+    """In-place shortening of one entry. Never returns empty for non-empty input."""
+    text = text.strip()
+    if max_chars <= 0:
+        return text[:1] if text else ""
+    if len(text) <= max_chars:
+        return text
+    if max_chars == 1:
+        return text[:1]
+    return text[: max_chars - 1].rstrip() + "…"
+
+
+def _near_duplicate_pair(left: str, right: str) -> bool:
+    left = left.strip()
+    right = right.strip()
+    if not left or not right:
+        return False
+    if left == right or left in right or right in left:
+        return True
+    window = min(48, len(left), len(right))
+    return window >= 16 and left[:window].lower() == right[:window].lower()
+
+
+def _merge_near_duplicate(left: str, right: str) -> str:
+    left = left.strip()
+    right = right.strip()
+    if left in right:
+        return right
+    if right in left:
+        return left
+    return left if len(left) >= len(right) else right
+
+
+def _durable_facts_preserved(
+    before: List[str], after: List[str], protected: Optional[set] = None,
+) -> bool:
+    """True when every pinned / protected entry from *before* is still in *after*."""
+    after_set = set(after)
+    protected = set(protected or ())
+    for idx, text in enumerate(before):
+        if idx in protected or is_pinned(text):
+            if text not in after_set:
+                return False
+    return True
+
+
+def consolidate_entries(
+    entries: List[str],
+    *,
+    limit: int,
+    protected: Optional[set] = None,
+    target_chars: Optional[int] = None,
+) -> List[str]:
+    """Free room by merging/summarizing oldest CONTENT. Never deletes an entry.
+
+    Pinned entries and indices in *protected* are left untouched. Entry count
+    decreases only when two near-duplicate CONTENT entries are merged into one
+    combined fact. Used by the drain when an LLM consolidator is unavailable
+    or its result is rejected.
+    """
+    working = list(entries)
+    protected_idx = set(protected or ())
+    if target_chars is None:
+        target_chars = target_char_budget(limit)
+
+    def total() -> int:
+        return entries_char_total(working)
+
+    changed = True
+    while changed and total() > target_chars:
+        changed = False
+        i = 0
+        while i < len(working):
+            if i in protected_idx or is_pinned(working[i]):
+                i += 1
+                continue
+            j = i + 1
+            while j < len(working):
+                if j in protected_idx or is_pinned(working[j]):
+                    j += 1
+                    continue
+                if _near_duplicate_pair(working[i], working[j]):
+                    merged = _merge_near_duplicate(working[i], working[j])
+                    trial = working[:i] + [merged] + working[i + 1 : j] + working[j + 1 :]
+                    if entries_char_total(trial) <= total():
+                        working = trial
+                        protected_idx = {
+                            (p - 1 if p > j else p) for p in protected_idx if p != j
+                        }
+                        changed = True
+                        break
+                j += 1
+            if changed:
+                break
+            i += 1
+
+    while total() > target_chars:
+        candidates = [
+            idx
+            for idx, text in enumerate(working)
+            if idx not in protected_idx
+            and not is_pinned(text)
+            and len(text.strip()) > _MIN_CONSOLIDATED_ENTRY_CHARS
+        ]
+        if not candidates:
+            break
+        idx = candidates[0]
+        excess = total() - target_chars
+        new_len = max(_MIN_CONSOLIDATED_ENTRY_CHARS, len(working[idx]) - excess)
+        if new_len >= len(working[idx]):
+            break
+        working[idx] = _summarize_entry_text(working[idx], new_len)
+
+    return working
 
 
 # ---------------------------------------------------------------------------
@@ -177,9 +335,18 @@ class MemoryStore:
         self.user_char_limit = user_char_limit
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
+        # Entry lists captured at load time (sanitized). Used so a pending
+        # overlay can be merged into injection without pulling mid-session
+        # landed writes into the cached prefix.
+        self._snapshot_entries: Dict[str, List[str]] = {"memory": [], "user": []}
         # Per-turn counter of failed at-capacity consolidation attempts; reset
         # at each turn boundary by reset_consolidation_failures() (#42405).
         self._consolidation_failures = 0
+        # Optional drain hook: (entries, target, limit, protected, target_chars,
+        # queued_operations=None) -> list[str] | None. The journal consumer
+        # installs an LLM consolidator here. apply_with_capacity falls back to
+        # deterministic merge/summarize when this is unset or rejects.
+        self.capacity_consolidator = None
 
     def reset_consolidation_failures(self) -> None:
         """Reset the per-turn consolidation-failure counter (call at turn start)."""
@@ -242,6 +409,10 @@ class MemoryStore:
         sanitized_user = self._sanitize_entries_for_snapshot(self.user_entries, "USER.md")
 
         # Capture frozen snapshot for system prompt injection
+        self._snapshot_entries = {
+            "memory": list(sanitized_memory),
+            "user": list(sanitized_user),
+        }
         self._system_prompt_snapshot = {
             "memory": self._render_block("memory", sanitized_memory),
             "user": self._render_block("user", sanitized_user),
@@ -395,8 +566,223 @@ class MemoryStore:
             return self.user_char_limit
         return self.memory_char_limit
 
+    def _usage_pct(self, target: str) -> int:
+        """Current usage as an integer percentage, clamped to [0,100]."""
+        current = self._char_count(target)
+        limit = self._char_limit(target)
+        if limit <= 0:
+            return 100
+        return min(100, int((current / limit) * 100))
+
+    def _should_journal_capacity_write(self, target: str, usage_pct: int) -> bool:
+        """Hysteresis gate for overflow journaling.
+
+        High-water: usage >= QUEUE_PCT (85%) enters journal mode.
+        Low-water: usage <= TARGET_PCT (70%) exits it.
+        In the band (TARGET, QUEUE), stay journaling while overflow work is
+        still pending so drain/apply cannot flap at the hard wall.
+        """
+        if usage_pct >= MEMORY_QUEUE_PCT:
+            return True
+        if usage_pct > MEMORY_TARGET_PCT and self._list_pending_for_target(target):
+            return True
+        return False
+
+    def _journal_capacity_write(
+        self, target: str, action: str, payload: Dict[str, Any],
+        current: int, limit: int,
+    ) -> Dict[str, Any]:
+        """Durably journal a capacity-increasing write to the pending queue.
+
+        Returns a ``queued``-shaped result so the agent knows the write is
+        accepted but not yet applied — it must not retry.
+        """
+        from tools import memory_pending_queue as pq
+        try:
+            # Overflow writes are content-idempotent (same as add). Do not
+            # stamp expected_previous_hash: a sibling queued add applied
+            # first changes the snapshot hash and would dead-letter a
+            # legitimate replace/remove. External drift is detected at
+            # apply time only when no sibling overflow write exists.
+            record = pq.enqueue(
+                kind=pq.KIND_OVERFLOW,
+                action=action,
+                target=target,
+                payload=payload,
+                summary=f"{action} to {target} (overflow)",
+                origin="overflow",
+            )
+        except Exception as e:
+            # Try fallback journal if SQLite is unavailable
+            record = self._journal_fallback(
+                action, target, payload, current, limit, str(e)
+            )
+            if (
+                record.get("success") is False
+                or record.get("accepted") is False
+                or record.get("reason") == "fallback_unavailable"
+            ):
+                return {
+                    "success": False,
+                    "accepted": False,
+                    "reason": "fallback_unavailable",
+                    "error": record.get("error") or (
+                        "Memory write was not accepted; queue and fallback "
+                        "journal are both unavailable."
+                    ),
+                    "queued": False,
+                    "target": target,
+                    "usage": f"{self._usage_pct(target)}% — {current:,}/{limit:,} chars",
+                    "entry_count": len(self._entries_for(target)),
+                }
+
+        return {
+            "success": True,
+            "queued": True,
+            "done": True,
+            "message": (
+                f"Memory {target} is at {current:,}/{limit:,} chars. "
+                f"This write has been durably accepted and queued for "
+                f"application (id={record.get('id', 'unknown')}). "
+                f"It will be applied automatically by the projection consumer "
+                f"or via /memory approve. Do not retry this write."
+            ),
+            "pending_id": record.get("id"),
+            "target": target,
+            "usage": f"{self._usage_pct(target)}% — {current:,}/{limit:,} chars",
+            "entry_count": len(self._entries_for(target)),
+        }
+
+    def _journal_fallback(
+        self, action: str, target: str, payload: Dict[str, Any],
+        current: int, limit: int, error: str,
+    ) -> Dict[str, Any]:
+        """Fallback journal to a JSONL file when the SQLite queue is unavailable."""
+        from pathlib import Path
+        import json as _json
+
+        fallback_path = get_memory_dir() / "pending_fallback.jsonl"
+        try:
+            record = {
+                "id": f"fallback-{int(time.time())}-{hash(action + target + str(payload)) & 0xFFFFFFFF:08x}",
+                "kind": "overflow",
+                "action": action,
+                "target": target,
+                "payload": payload,
+                "queued_at": time.time(),
+                "queue_error": error,
+            }
+            line = _json.dumps(record, ensure_ascii=False) + "\n"
+            with open(fallback_path, "a", encoding="utf-8") as f:
+                f.write(line)
+                f.flush()
+                import os
+                os.fsync(f.fileno())
+            logger.warning("memory_tool: fallback-journaled %s to %s (queue error: %s)",
+                           action, fallback_path, error[:120])
+            return record
+        except Exception as fallback_err:
+            logger.exception("memory_tool: fallback journal also failed")
+            return {
+                "success": False,
+                "accepted": False,
+                "reason": "fallback_unavailable",
+                "error": (
+                    f"Failed to accept memory write: SQLite queue ({error[:120]}) "
+                    f"and fallback journal ({fallback_err}) both unavailable."
+                ),
+            }
+
+    def _fallback_pending_for_target(self, target: str) -> List[Dict[str, Any]]:
+        """Accepted overflow records from the JSONL fallback journal."""
+        import json as _json
+
+        path = get_memory_dir() / "pending_fallback.jsonl"
+        if not path.exists():
+            return []
+        out: List[Dict[str, Any]] = []
+        try:
+            with open(path, encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = _json.loads(line)
+                    except ValueError:
+                        continue
+                    if rec.get("target") == target:
+                        out.append(rec)
+        except OSError:
+            return out
+        return out
+
+    def _list_pending_for_target(self, target: str) -> List[Dict[str, Any]]:
+        """Return accepted/queued overflow records for *target*, oldest first."""
+        records: List[Dict[str, Any]] = []
+        try:
+            from tools import memory_pending_queue as pq
+            records.extend(
+                r for r in pq.list_active(kind=pq.KIND_OVERFLOW)
+                if r.get("target") == target
+            )
+        except Exception:
+            pass
+        records.extend(self._fallback_pending_for_target(target))
+        records.sort(key=lambda r: r.get("created_at") or r.get("queued_at") or 0)
+        return records
+
+    @staticmethod
+    def _apply_overlay_op(working: List[str], op: Optional[Dict[str, Any]]) -> List[str]:
+        """Apply one queued op to a copy of entries. Skip unmatchable ops."""
+        op = op or {}
+        act = op.get("action")
+        content = (op.get("content") or "").strip()
+        old_text = (op.get("old_text") or "").strip()
+        if act == "add":
+            if content and content not in working:
+                working.append(content)
+        elif act == "replace":
+            if old_text and content:
+                matches = [j for j, e in enumerate(working) if old_text in e]
+                if len({working[j] for j in matches}) == 1:
+                    working[matches[0]] = content
+        elif act == "remove":
+            if old_text:
+                matches = [j for j, e in enumerate(working) if old_text in e]
+                if len({working[j] for j in matches}) == 1:
+                    working.pop(matches[0])
+        return working
+
+    def _apply_pending_overlay(
+        self, entries: List[str], records: List[Dict[str, Any]],
+    ) -> List[str]:
+        """Replay queued overflow records onto *entries* in enqueue order."""
+        working = list(entries)
+        for rec in records:
+            action = rec.get("action")
+            payload = rec.get("payload") or {}
+            if action == "batch":
+                ops = payload.get("operations") or []
+            else:
+                ops = [{
+                    "action": action,
+                    "content": payload.get("content"),
+                    "old_text": payload.get("old_text"),
+                }]
+            for op in ops:
+                working = self._apply_overlay_op(working, op)
+        return working
+
+    def entries_for_read(self, target: str) -> List[str]:
+        """Live on-disk entries plus accepted/queued overflow writes."""
+        return self._apply_pending_overlay(
+            list(self._entries_for(target)),
+            self._list_pending_for_target(target),
+        )
+
     def add(self, target: str, content: str) -> Dict[str, Any]:
-        """Append a new entry. Returns error if it would exceed the char limit."""
+        """Append a new entry. Journals to the pending queue when at capacity."""
         content = content.strip()
         if not content:
             return {"success": False, "error": "Content cannot be empty."}
@@ -407,18 +793,6 @@ class MemoryStore:
             return {"success": False, "error": scan_error}
 
         with self._file_lock(self._path_for(target)):
-            # Re-read from disk under lock to pick up writes from other sessions.
-            # For add (append-only), we skip the drift guard — appending never
-            # clobbers existing content, so round-trip mismatches from prior
-            # tool-written entries in the same session are harmless.  The drift
-            # guard remains active for replace/remove where full-file rewrite
-            # would discard un-roundtrippable content (issue #26045).
-            #
-            # But "append never clobbers" only holds when the reload actually
-            # read the file. add rewrites the WHOLE file from the parsed
-            # entries, so a file that exists but read as empty (transient lock,
-            # permission blip, I/O error) would be rewritten down to just the
-            # new entry — wiping every prior memory. Refuse instead.
             if self._reload_target(target, skip_drift=True) is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))
 
@@ -432,9 +806,17 @@ class MemoryStore:
             # Calculate what the new total would be
             new_entries = entries + [content]
             new_total = len(ENTRY_DELIMITER.join(new_entries))
+            current = self._char_count(target)
+            usage_pct = self._usage_pct(target)
 
             if new_total > limit:
-                current = self._char_count(target)
+                if self._should_journal_capacity_write(target, usage_pct):
+                    return self._journal_capacity_write(
+                        target, "add", {"content": content},
+                        current, limit,
+                    )
+                # Below queue threshold — still reject with consolidation
+                # guidance, but don't journal (the model can consolidate in-turn).
                 return self._consolidation_failure({
                     "success": False,
                     "error": (
@@ -444,7 +826,7 @@ class MemoryStore:
                         f"shorter ones or 'remove' stale or less important entries (see "
                         f"current_entries below), then retry this add — all in this turn."
                     ),
-                    "current_entries": entries,
+                    "current_entries": self.entries_for_read(target),
                     "usage": f"{current:,}/{limit:,}",
                 })
 
@@ -455,7 +837,10 @@ class MemoryStore:
         return self._success_response(target, "Entry added.")
 
     def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
-        """Find entry containing old_text substring, replace it with new_content."""
+        """Find entry containing old_text substring, replace it with new_content.
+
+        Journals to the pending queue when the replacement would exceed the
+        char limit and the store is at or above the queue threshold."""
         old_text = old_text.strip()
         new_content = new_content.strip()
         if not old_text:
@@ -482,7 +867,7 @@ class MemoryStore:
                 return self._consolidation_failure({
                     "success": False,
                     "error": f"No entry matched '{old_text}'. Check current_entries below and retry with the exact text of the entry you want to replace.",
-                    "current_entries": entries,
+                    "current_entries": self.entries_for_read(target),
                 })
 
             if len(matches) > 1:
@@ -499,14 +884,29 @@ class MemoryStore:
 
             idx = matches[0][0]
             limit = self._char_limit(target)
+            current = self._char_count(target)
 
             # Check that replacement doesn't blow the budget
             test_entries = entries.copy()
             test_entries[idx] = new_content
             new_total = len(ENTRY_DELIMITER.join(test_entries))
+            old_entry_len = len(entries[idx])
+            new_entry_len = len(new_content)
 
             if new_total > limit:
-                current = self._char_count(target)
+                usage_pct = self._usage_pct(target)
+                # If the store is at the queue threshold AND this is a
+                # capacity-increasing replace (new > old), journal it.
+                if (
+                    self._should_journal_capacity_write(target, usage_pct)
+                    and new_entry_len > old_entry_len
+                ):
+                    return self._journal_capacity_write(
+                        target, "replace",
+                        {"old_text": old_text, "content": new_content},
+                        current, limit,
+                    )
+                # Below queue threshold or non-increasing — reject with guidance.
                 return self._consolidation_failure({
                     "success": False,
                     "error": (
@@ -515,7 +915,7 @@ class MemoryStore:
                         f"entries to make room (see current_entries below), then retry — all "
                         f"in this turn."
                     ),
-                    "current_entries": entries,
+                    "current_entries": self.entries_for_read(target),
                     "usage": f"{current:,}/{limit:,}",
                 })
 
@@ -545,7 +945,7 @@ class MemoryStore:
                 return self._consolidation_failure({
                     "success": False,
                     "error": f"No entry matched '{old_text}'. Check current_entries below and retry with the exact text of the entry you want to remove.",
-                    "current_entries": entries,
+                    "current_entries": self.entries_for_read(target),
                 })
 
             if len(matches) > 1:
@@ -659,6 +1059,15 @@ class MemoryStore:
             new_total = len(ENTRY_DELIMITER.join(working)) if working else 0
             if new_total > limit:
                 current = self._char_count(target)
+                usage_pct = self._usage_pct(target)
+                # If at the queue threshold, journal the entire batch rather
+                # than rejecting — the model already tried to consolidate.
+                if self._should_journal_capacity_write(target, usage_pct):
+                    return self._journal_capacity_write(
+                        target, "batch",
+                        {"operations": operations},
+                        current, limit,
+                    )
                 return self._consolidation_failure({
                     "success": False,
                     "error": (
@@ -666,7 +1075,7 @@ class MemoryStore:
                         f"{new_total:,}/{limit:,} chars -- over the limit. Remove or shorten more "
                         f"entries in the same batch (see current_entries below), then retry."
                     ),
-                    "current_entries": self._entries_for(target),
+                    "current_entries": self.entries_for_read(target),
                     "usage": f"{current:,}/{limit:,}",
                 })
 
@@ -677,8 +1086,7 @@ class MemoryStore:
         return self._success_response(target, f"Applied {len(operations)} operation(s).")
 
     def apply_with_capacity(self, target: str, operations: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Apply add/replace/remove operations, evicting to make room instead
-        of queuing an overflow for later review.
+        """Apply add/replace/remove operations without deleting durable entries.
 
         This is the projection consumer's entry point (see
         ``tools/memory_projection.py``) for replaying a journal record that
@@ -691,23 +1099,20 @@ class MemoryStore:
 
         Validation and content scanning mirror :meth:`apply_batch` exactly
         (same op semantics, same all-or-nothing intent for malformed input).
-        The one behavioral difference is what happens when the final result
-        would exceed the char limit: instead of durably queuing the whole
-        batch, this evicts existing entries to make room, oldest first,
-        skipping:
+        When the projected store is above TARGET_PCT (or over the hard
+        limit), this consolidates oldest CONTENT -- merge near-duplicates,
+        then summarize -- and never FIFO-deletes an entry. Pinned entries
+        and entries this SAME call is adding/replacing are left intact.
 
-          * entries this SAME call is adding/replacing (protected -- eviction
-            must not undo the very write it's trying to land)
-          * pinned entries (see :func:`is_pinned`)
+        The journal consumer should install :attr:`capacity_consolidator`
+        (LLM-guided) before drain; if that hook is missing or rejects, a
+        deterministic consolidator runs instead.
 
-        Returns the normal success/error shape plus, on success, an
-        ``"evicted"`` list of the entry texts that were dropped (empty if
-        none were needed). If eviction of every evictable entry still isn't
-        enough to fit, returns ``{"success": False, "unresolvable": True,
-        ...}`` -- the caller (the projection consumer) must dead-letter the
-        record rather than retry it, since retrying without operator
-        intervention (unpinning something, raising the limit) can never
-        succeed.
+        Returns the normal success/error shape plus ``"evicted": []`` (kept
+        for caller compatibility; drain does not delete). If consolidation
+        cannot bring the result under the hard limit, returns
+        ``{"success": False, "unresolvable": True, ...}`` -- the caller must
+        dead-letter the record and alert the operator.
         """
         if not operations:
             return {"success": False, "error": "operations list is empty."}
@@ -788,29 +1193,50 @@ class MemoryStore:
                         f"{pos}: unknown action. Use add, replace, or remove.",
                     )
 
-            def _total(entries: List[str]) -> int:
-                return len(ENTRY_DELIMITER.join(entries)) if entries else 0
+            target_chars = target_char_budget(limit)
+            if entries_char_total(working) > target_chars:
+                consolidator = getattr(self, "capacity_consolidator", None)
+                if callable(consolidator):
+                    try:
+                        candidate = consolidator(
+                            working,
+                            target,
+                            limit,
+                            protected,
+                            target_chars,
+                            queued_operations=operations,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "memory_tool: capacity consolidator failed for %s",
+                            target,
+                        )
+                        candidate = None
+                    if (
+                        isinstance(candidate, list)
+                        and candidate
+                        and _durable_facts_preserved(working, candidate, protected)
+                        and entries_char_total(candidate) <= limit
+                    ):
+                        working = candidate
+                if entries_char_total(working) > target_chars:
+                    working = consolidate_entries(
+                        working,
+                        limit=limit,
+                        protected=protected,
+                        target_chars=target_chars,
+                    )
 
-            evicted: List[str] = []
-            idx = 0
-            while _total(working) > limit and idx < len(working):
-                if idx in protected or is_pinned(working[idx]):
-                    idx += 1
-                    continue
-                evicted.append(working.pop(idx))
-                protected = {j - 1 if j > idx else j for j in protected}
-                # Deliberately do not advance idx -- the list shifted left.
-
-            if _total(working) > limit:
+            if entries_char_total(working) > limit:
                 current = self._char_count(target)
                 return {
                     "success": False,
                     "unresolvable": True,
                     "error": (
-                        f"Cannot make room in {target}: even after evicting every "
-                        f"evictable (unpinned, untouched) entry, the result "
-                        f"({_total(working):,} chars) still exceeds the "
-                        f"{limit:,}-char limit. Unpin/shorten entries or raise "
+                        f"Cannot make room in {target}: consolidation could not "
+                        f"bring the store under the {limit:,}-char limit "
+                        f"(result {entries_char_total(working):,} chars) without "
+                        f"deleting durable entries. Unpin/shorten entries or raise "
                         f"the limit."
                     ),
                     "current_entries": self._entries_for(target),
@@ -821,7 +1247,7 @@ class MemoryStore:
             self.save_to_disk(target)
 
         resp = self._success_response(target, f"Applied {len(operations)} operation(s).")
-        resp["evicted"] = evicted
+        resp["evicted"] = []
         return resp
 
     def _batch_error(self, target: str, message: str) -> Dict[str, Any]:
@@ -831,21 +1257,31 @@ class MemoryStore:
         return self._consolidation_failure({
             "success": False,
             "error": message + " No operations were applied (batch is all-or-nothing).",
-            "current_entries": self._entries_for(target),
+            "current_entries": self.entries_for_read(target),
             "usage": f"{current:,}/{limit:,}",
         })
 
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """
-        Return the frozen snapshot for system prompt injection.
+        Return the snapshot for system prompt injection.
 
-        This returns the state captured at load_from_disk() time, NOT the live
-        state. Mid-session writes do not affect this. This keeps the system
-        prompt stable across all turns, preserving the prefix cache.
+        Landed mid-session writes stay out of this block (prefix-cache
+        invariant). Accepted/queued overflow records are merged on top of
+        the load-time snapshot so this session can read its own queued
+        writes. When the overflow queue is empty the returned string is
+        the frozen load-time block, byte-stable.
 
-        Returns None if the snapshot is empty (no entries at load time).
+        Returns None if the (possibly overlaid) snapshot is empty.
         """
-        block = self._system_prompt_snapshot.get(target, "")
+        pending = self._list_pending_for_target(target)
+        if not pending:
+            block = self._system_prompt_snapshot.get(target, "")
+            return block if block else None
+        base = list(self._snapshot_entries.get(target, []))
+        merged = self._apply_pending_overlay(base, pending)
+        filename = "USER.md" if target == "user" else "MEMORY.md"
+        sanitized = self._sanitize_entries_for_snapshot(merged, filename)
+        block = self._render_block(target, sanitized)
         return block if block else None
 
     # -- Internal helpers --
@@ -863,7 +1299,7 @@ class MemoryStore:
         entries = self._entries_for(target)
         current = self._char_count(target)
         limit = self._char_limit(target)
-        pct = min(100, int((current / limit) * 100)) if limit > 0 else 0
+        pct = self._usage_pct(target)
 
         # The success response is intentionally TERMINAL: it confirms the write
         # landed and tells the model to stop. We do NOT echo the full entries
@@ -882,6 +1318,18 @@ class MemoryStore:
         if message:
             resp["message"] = message
         resp["note"] = "Write saved. This update is complete — do not repeat it."
+
+        # Capacity-awareness: surface queued count and warn when near the cap.
+        pending = self._list_pending_for_target(target)
+        if pending:
+            resp["pending_count"] = len(pending)
+        if pct >= MEMORY_WARN_PCT:
+            resp["capacity_note"] = (
+                f"Memory {target} is at {pct}% ({current:,}/{limit:,} chars). "
+                f"Consider consolidating soon — use an 'operations' batch with "
+                f"replace/remove to shorten or remove stale entries."
+            )
+
         return resp
 
     def _render_block(self, target: str, entries: List[str]) -> str:
@@ -1190,7 +1638,7 @@ def _missing_old_text_error(store: "MemoryStore", target: str, action: str) -> s
     the call with ``old_text`` set to a unique substring of the entry it means.
     Mirrors the batch path's ``_batch_error`` shape. (issues #43412, #49466)
     """
-    entries = store._entries_for(target)
+    entries = store.entries_for_read(target)
     current = store._char_count(target)
     limit = store._char_limit(target)
     return json.dumps(
