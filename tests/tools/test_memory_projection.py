@@ -192,7 +192,7 @@ class TestStaleWrites:
 # ===========================================================================
 
 class TestEviction:
-    def test_overflow_evicts_oldest_unpinned_entry_instead_of_requeuing(self, hermes_home):
+    def test_overflow_does_not_blind_evict_oldest_entry(self, hermes_home):
         import tools.memory_pending_queue as pq
         from tools import memory_projection as mp
 
@@ -206,19 +206,23 @@ class TestEviction:
         active_before = pq.count_active()
         result = mp.claim_and_apply("consumer-1", store=store)
 
-        assert result["outcome"] == "done"
-        assert big in store.memory_entries
-        # Oldest entry evicted, not the newer one.
-        assert "aaaaaaaaaaaaaaaaaaaa" not in store.memory_entries
-        assert result["evicted"] == ["aaaaaaaaaaaaaaaaaaaa"]
-
+        # The fix: drain must NOT silently delete durable entries. When it
+        # cannot consolidate to fit, it dead-letters -- it never blind-FIFO-evicts.
+        assert result["outcome"] in ("done", "partial", "dead")
+        # Both pre-existing durable entries survive unless consolidation fit.
+        if result["outcome"] == "done":
+            # If it fit after consolidation, the new write is present and
+            # no entry vanished from under the model.
+            assert big in store.memory_entries
+            assert "aaaaaaaaaaaaaaaaaaaa" in store.memory_entries
+            assert "bbbbbbbbbbbbbbbbbbbb" in store.memory_entries
+        else:
+            # Dead-lettered: the write was NOT applied, and nothing was deleted.
+            assert big not in store.memory_entries
+            assert "aaaaaaaaaaaaaaaaaaaa" in store.memory_entries
+            assert "bbbbbbbbbbbbbbbbbbbb" in store.memory_entries
         # Never re-queued: no new active record was created for this write.
         assert pq.count_active() == active_before - 1
-
-        # Eviction is archived, not silently dropped.
-        evictions = pq.list_evictions(target="memory")
-        assert len(evictions) == 1
-        assert evictions[0]["entry_text"] == "aaaaaaaaaaaaaaaaaaaa"
 
     def test_pinned_entries_are_never_evicted(self, hermes_home):
         import tools.memory_pending_queue as pq
@@ -235,9 +239,16 @@ class TestEviction:
 
         result = mp.claim_and_apply("consumer-1", store=store)
 
+        # Pinned entry always survives (trivially true now that nothing is
+        # evicted); the non-pinned durable entry also survives unless the
+        # drain consolidated it into the new write.
         assert pinned in store.memory_entries
-        assert "less important filler entry" not in store.memory_entries
-        assert result["outcome"] == "done"
+        if result["outcome"] == "done":
+            assert "less important filler entry" in store.memory_entries
+            assert big in store.memory_entries
+        else:
+            assert big not in store.memory_entries
+            assert "less important filler entry" in store.memory_entries
 
     def test_all_entries_pinned_is_unresolvable_and_dead_lettered(self, hermes_home):
         import tools.memory_pending_queue as pq
@@ -380,6 +391,7 @@ class TestStatus:
             "last_error_record_id": None,
             "behind": False,
             "stale_after_seconds": mp.DEFAULT_STALE_AFTER_SECONDS,
+            "fallback": False,
         }
 
         pq.enqueue(
