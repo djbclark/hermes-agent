@@ -37,9 +37,10 @@ Idempotency:
   * ``add`` is a no-op success if the content is already present (covers a
     lease-expiry-then-reclaim double-apply, or a record that was already
     manually approved via ``/memory approve``).
-  * ``replace``/``remove``/``batch`` carry ``expected_previous_hash`` (set at
-    enqueue time) and are dead-lettered rather than blindly replayed if the
-    store's content changed since -- see ``pq.is_stale``.
+  * Overflow ``replace``/``remove``/``batch`` use the same content
+    idempotency (already-applied replace/remove is ``done``). Snapshot-hash
+    mismatches dead-letter only on genuine external drift -- a sibling
+    overflow write that landed first is not external drift.
 
 Capacity handling (the reason this module exists rather than just calling
 ``tools.memory_tool.apply_memory_pending`` in a loop): when the projected
@@ -77,6 +78,39 @@ logger = logging.getLogger(__name__)
 DEFAULT_STALE_AFTER_SECONDS = 3600.0
 
 
+def _overflow_siblings(record: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Other overflow writes on the same target that can change the snapshot.
+
+    Includes still-active siblings and siblings marked done after this
+    record was queued (already applied in this drain pass).
+    """
+    rec_id = record.get("id")
+    target = record.get("target")
+    queued_at = record.get("created_at") or 0.0
+    siblings: List[Dict[str, Any]] = []
+    for other in pq.list_all(kind=pq.KIND_OVERFLOW):
+        if other.get("id") == rec_id or other.get("target") != target:
+            continue
+        status = other.get("status")
+        if status in pq.ACTIVE_STATUSES:
+            siblings.append(other)
+        elif status == pq.STATUS_DONE and (other.get("updated_at") or 0.0) >= queued_at:
+            siblings.append(other)
+    return siblings
+
+
+def _external_overflow_drift(record: Dict[str, Any], store: MemoryStore, target: str) -> bool:
+    """True only when a stamped hash mismatches and no sibling explains it."""
+    if not record.get("expected_previous_hash"):
+        return False
+    current_hash = pq.content_snapshot_hash(
+        ENTRY_DELIMITER.join(store._entries_for(target))
+    )
+    if not pq.is_stale(record, current_hash):
+        return False
+    return not _overflow_siblings(record)
+
+
 def _apply_claimed(record: Dict[str, Any], store: MemoryStore) -> Dict[str, Any]:
     """Apply one claimed journal record to *store*. Never raises for
     ordinary application failures -- returns ``{"outcome": ..., "error": ...}``
@@ -88,21 +122,34 @@ def _apply_claimed(record: Dict[str, Any], store: MemoryStore) -> Dict[str, Any]
     payload = record.get("payload") or {}
 
     if action in {"replace", "remove", "batch"}:
-        expected_hash = record.get("expected_previous_hash")
-        if expected_hash:
-            current_hash = pq.content_snapshot_hash(
-                ENTRY_DELIMITER.join(store._entries_for(target))
-            )
-            if pq.is_stale(record, current_hash):
+        kind = record.get("kind")
+        if kind == pq.KIND_OVERFLOW:
+            if _external_overflow_drift(record, store, target):
                 return {
                     "outcome": "dead",
                     "error": (
                         f"Stale {action}: memory target '{target}' changed since "
-                        "this write was queued (expected_previous_hash mismatch). "
-                        "Not replayed -- blindly applying could clobber a newer "
-                        "edit. Review the current entries manually."
+                        "this write was queued (external drift; no sibling "
+                        "overflow write explains the hash mismatch). "
+                        "Not replayed. Review the current entries manually."
                     ),
                 }
+        else:
+            expected_hash = record.get("expected_previous_hash")
+            if expected_hash:
+                current_hash = pq.content_snapshot_hash(
+                    ENTRY_DELIMITER.join(store._entries_for(target))
+                )
+                if pq.is_stale(record, current_hash):
+                    return {
+                        "outcome": "dead",
+                        "error": (
+                            f"Stale {action}: memory target '{target}' changed since "
+                            "this write was queued (expected_previous_hash mismatch). "
+                            "Not replayed -- blindly applying could clobber a newer "
+                            "edit. Review the current entries manually."
+                        ),
+                    }
 
     if action == "add":
         content = (payload.get("content") or "").strip()
@@ -115,14 +162,24 @@ def _apply_claimed(record: Dict[str, Any], store: MemoryStore) -> Dict[str, Any]
         operations = [{"action": "add", "content": content}]
 
     elif action == "replace":
+        content = (payload.get("content") or "").strip()
+        old_text = (payload.get("old_text") or "").strip()
+        entries = store._entries_for(target)
+        if content and content in entries:
+            others = [entry for entry in entries if entry != content]
+            if not any(old_text in entry for entry in others):
+                return {"outcome": "done", "result": {"idempotent": True}, "evicted": []}
         operations = [{
             "action": "replace",
-            "old_text": payload.get("old_text") or "",
-            "content": payload.get("content") or "",
+            "old_text": old_text,
+            "content": content,
         }]
 
     elif action == "remove":
-        operations = [{"action": "remove", "old_text": payload.get("old_text") or ""}]
+        old_text = (payload.get("old_text") or "").strip()
+        if old_text and not any(old_text in entry for entry in store._entries_for(target)):
+            return {"outcome": "done", "result": {"idempotent": True}, "evicted": []}
+        operations = [{"action": "remove", "old_text": old_text}]
 
     elif action == "batch":
         operations = payload.get("operations") or []
@@ -137,6 +194,8 @@ def _apply_claimed(record: Dict[str, Any], store: MemoryStore) -> Dict[str, Any]
         return {"outcome": "done", "result": result, "evicted": result.get("evicted") or []}
     if result.get("unresolvable"):
         return {"outcome": "dead", "error": result.get("error", "unresolvable")}
+    if result.get("drift_backup"):
+        return {"outcome": "dead", "error": result.get("error", "external drift")}
     return {"outcome": "retry", "error": result.get("error", "apply failed")}
 
 
@@ -223,6 +282,7 @@ def run_once(
     *,
     max_records: int = 100,
     kind: Optional[str] = None,
+    store: Optional[MemoryStore] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """Drain up to ``max_records`` journal records in one pass.
@@ -235,10 +295,10 @@ def run_once(
     ``lease_lost``).
     """
     owner = owner or f"projection-{uuid.uuid4().hex[:8]}"
-    store = load_on_disk_store()
+    active_store = store if store is not None else load_on_disk_store()
     results: List[Dict[str, Any]] = []
     for _ in range(max_records):
-        r = claim_and_apply(owner, kind=kind, store=store, **kwargs)
+        r = claim_and_apply(owner, kind=kind, store=active_store, **kwargs)
         if r is None:
             break
         results.append(r)
@@ -281,6 +341,14 @@ def get_status(
 
     evicted_count = pq.count_evictions()
 
+    fallback = False
+    try:
+        from tools.memory_tool import get_memory_dir
+        fallback_path = get_memory_dir() / "pending_fallback.jsonl"
+        fallback = fallback_path.exists() and fallback_path.stat().st_size > 0
+    except OSError:
+        fallback = False
+
     return {
         "active_count": len(active),
         "pending_count": sum(1 for r in active if r["status"] == pq.STATUS_PENDING),
@@ -293,6 +361,7 @@ def get_status(
         "last_error_record_id": last_error_record["id"] if last_error_record else None,
         "behind": behind,
         "stale_after_seconds": stale_after_seconds,
+        "fallback": fallback,
     }
 
 

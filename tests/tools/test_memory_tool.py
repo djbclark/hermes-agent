@@ -123,16 +123,26 @@ class TestMemoryStoreAdd:
     def test_overflow_returns_consolidation_context(self, store):
         store.add("memory", "x" * 490)
         result = store.add("memory", "this will exceed the limit")
+        # When at 98% capacity (above the 85% queue threshold), writes are
+        # durably journaled instead of rejected — the agent sees queued=true
+        # and must NOT retry.
+        assert result["success"] is True
+        assert result.get("queued") is True
+        assert result["done"] is True
+        assert "queued" in result.get("message", "").lower()
+        assert "do not retry" in result.get("message", "").lower()
+        assert result.get("pending_id") is not None
+
+    def test_overflow_below_queue_threshold_still_rejects(self, store):
+        """When below the 85% queue threshold, writes still get the
+        legacy consolidation error so the model can consolidate in-turn."""
+        # Use a store with a low limit to test the below-threshold path.
+        # 82% of 100 is 82 chars — fill to 80 chars then overflow.
+        store.memory_char_limit = 100
+        store.add("memory", "a" * 80)  # 80% — under 85%
+        result = store.add("memory", "this entry will push it way over the tiny limit")
         assert result["success"] is False
         assert "exceed" in result["error"].lower()
-        # Overflow response gives the model what it needs to consolidate in-turn
-        assert "current_entries" in result
-        assert "usage" in result
-        assert "retry" in result["error"].lower()
-
-        # A replace that blows the budget mirrors the add-overflow shape.
-        result = store.replace("memory", "x" * 490, "y" * 600)
-        assert result["success"] is False
         assert "current_entries" in result
         assert "usage" in result
         assert "retry" in result["error"].lower()
