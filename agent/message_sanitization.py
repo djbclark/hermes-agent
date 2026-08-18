@@ -106,6 +106,15 @@ def _sanitize_messages_surrogates(messages: list) -> bool:
             found = True
         tool_calls = msg.get("tool_calls")
         if isinstance(tool_calls, list):
+            # DeepSeek v4-flash (and some reasoning models) emit an empty
+            # tool_calls list when they mean "no tool call". The OpenAI SDK
+            # rejects an assistant message carrying tool_calls=[] with a 400
+            # ("empty array ... minimum length 1"). Coerce an empty list to
+            # absent so the message is well-formed and alternation holds.
+            if len(tool_calls) == 0:
+                msg.pop("tool_calls", None)
+                found = True
+                continue
             for tc in tool_calls:
                 if not isinstance(tc, dict):
                     continue
@@ -371,16 +380,24 @@ def _sanitize_messages_non_ascii(messages: list) -> bool:
         # Sanitize tool_calls
         tool_calls = msg.get("tool_calls")
         if isinstance(tool_calls, list):
-            for tc in tool_calls:
-                if isinstance(tc, dict):
-                    fn = tc.get("function", {})
-                    if isinstance(fn, dict):
-                        fn_args = fn.get("arguments")
-                        if isinstance(fn_args, str):
-                            sanitized = _strip_non_ascii(fn_args)
-                            if sanitized != fn_args:
-                                fn["arguments"] = sanitized
-                                found = True
+            # DeepSeek v4-flash (and some reasoning models) emit an empty
+            # tool_calls list when they mean "no tool call". The OpenAI SDK
+            # rejects an assistant message carrying tool_calls=[] with a 400
+            # ("empty array ... minimum length 1"). Coerce an empty list to
+            # absent so the message is well-formed and alternation holds.
+            if len(tool_calls) == 0:
+                msg.pop("tool_calls", None)
+            else:
+                for tc in tool_calls:
+                    if isinstance(tc, dict):
+                        fn = tc.get("function", {})
+                        if isinstance(fn, dict):
+                            fn_args = fn.get("arguments")
+                            if isinstance(fn_args, str):
+                                sanitized = _strip_non_ascii(fn_args)
+                                if sanitized != fn_args:
+                                    fn["arguments"] = sanitized
+                                    found = True
         # Sanitize any additional top-level string fields (e.g. reasoning_content)
         for key, value in msg.items():
             if key in {"content", "name", "tool_calls", "role"}:
