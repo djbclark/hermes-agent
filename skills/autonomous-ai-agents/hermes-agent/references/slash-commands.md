@@ -90,6 +90,7 @@ it. New commands land often; `/help` in-session is always authoritative.
 ```
 /help                    Show commands
 /usage [reset]           Token usage and rate limits
+/aiuse                   Live AI subscription/API usage (direct, no AI turn)
 /insights [days]         Usage analytics
 /whoami                  Slash-command access level (admin/user)
 /profile                 Active profile info

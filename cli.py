@@ -10447,6 +10447,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._manual_compress(cmd_original)
         elif canonical == "usage":
             self._handle_usage_command(cmd_original)
+        elif canonical == "aiuse":
+            from hermes_cli.aiuse_command import run_aiuse_for_chat
+
+            self._console_print(run_aiuse_for_chat(), highlight=False, markup=False)
         elif canonical == "subscription":
             self._show_subscription()
         elif canonical == "topup":

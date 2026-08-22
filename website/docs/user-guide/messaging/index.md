@@ -206,6 +206,7 @@ platform network disconnect as an event-loop failure.
 | `/resume [name]` | Resume a previously named session |
 | `/sessions [all] [search <query>]` | List previous sessions; `search <query>` filters by title or id |
 | `/usage` | Show token usage for this session (`/usage reset [--force]` redeems a banked Codex limit reset) |
+| `/aiuse` | Dump the live `aiuse --for-chat` subscription/API usage report directly, without an AI turn |
 | `/insights [days]` | Show usage insights and analytics |
 | `/reasoning [level\|show\|hide]` | Change reasoning effort or toggle reasoning display |
 | `/voice [on\|off\|tts\|join\|leave\|status]` | Control messaging voice replies and Discord voice-channel behavior |

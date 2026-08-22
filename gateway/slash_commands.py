@@ -5007,6 +5007,12 @@ class GatewaySlashCommandsMixin:
         except Exception:
             return []
 
+    async def _handle_aiuse_command(self, event: MessageEvent) -> str:
+        """Return the live aiuse report directly, without an AI turn."""
+        from hermes_cli.aiuse_command import run_aiuse_for_chat
+
+        return await asyncio.to_thread(run_aiuse_for_chat)
+
     async def _handle_usage_command(self, event: MessageEvent) -> str:
         """Handle /usage command -- show token usage for the current session.
 
