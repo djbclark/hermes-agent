@@ -461,6 +461,45 @@ def _maybe_apply_moa_cache_control(
         return messages
 
 
+# ── Advisor cooldown (fail-fast on exhausted advisor providers) ──
+# A reference advisor that fails on a rate-limit / upstream / timeout error is
+# skipped for ``reference_cooldown_seconds`` so an exhausted free tier doesn't
+# make every subsequent turn wait on a dead endpoint (the per-advisor timeout
+# plus the fallback-chain walk, repeated per turn). Keyed by normalized
+# (provider, model); in-memory only — the point is to stop the hot retry loop
+# within a gateway process, not to persist outage state across restarts.
+
+_REFERENCE_COOLDOWN_UNTIL: dict[tuple[str, str], float] = {}
+
+# Note text for a slot skipped because its advisor is still cooling down.
+_REFERENCE_COOLDOWN_NOTE = "[skipped: advisor cooling down after failure]"
+
+
+def _reference_cooldown_key(slot: dict[str, Any]) -> tuple[str, str] | None:
+    """Return the normalized (provider, model) key for a slot, or None."""
+    provider = str(slot.get("provider") or "").strip().lower()
+    model = str(slot.get("model") or "").strip().lower()
+    if not provider or not model:
+        return None
+    return provider, model
+
+
+def _reference_is_cooling_down(slot: dict[str, Any]) -> bool:
+    """True when this advisor's cooldown window has not yet elapsed."""
+    key = _reference_cooldown_key(slot)
+    if key is None:
+        return False
+    return _REFERENCE_COOLDOWN_UNTIL.get(key, 0.0) > time.monotonic()
+
+
+def _record_reference_cooldown(slot: dict[str, Any], cooldown_seconds: float) -> None:
+    """Mark an advisor as cooling down for ``cooldown_seconds`` (0 = no-op)."""
+    key = _reference_cooldown_key(slot)
+    if key is None or cooldown_seconds <= 0:
+        return
+    _REFERENCE_COOLDOWN_UNTIL[key] = time.monotonic() + cooldown_seconds
+
+
 def _run_reference(
     slot: dict[str, Any],
     ref_messages: list[dict[str, Any]],
@@ -468,6 +507,7 @@ def _run_reference(
     temperature: float | None = None,
     max_tokens: int | None = None,
     reference_timeout: float | None = None,
+    reference_cooldown_seconds: float = 0.0,
     context_length_cache: Any = None,
     cache_disabled: bool | None = None,
 ) -> tuple[str, str, Any]:
@@ -617,6 +657,9 @@ def _run_reference(
         return label, _output_text, acct
     except Exception as exc:
         logger.warning("MoA reference model %s failed: %s", label, exc)
+        # Fail-fast: cool this advisor down so the next turns skip it instead
+        # of re-walking the timeout + fallback chain on a dead endpoint.
+        _record_reference_cooldown(slot, reference_cooldown_seconds)
         return label, f"[failed: {exc}]", _RefAccounting(
             CanonicalUsage(),
             messages=[{"role": "system", "content": _REFERENCE_SYSTEM_PROMPT}, *ref_messages],
@@ -781,6 +824,7 @@ def _run_references_parallel(
     max_tokens: int | None = None,
     progress_callback: Any = None,
     reference_timeout: float | None = None,
+    reference_cooldown_seconds: float = 0.0,
     agent: Any = None,
     late_accounting_sink: Any = None,
 ) -> list[tuple[str, str, Any]]:
@@ -852,6 +896,15 @@ def _run_references_parallel(
                     _RefAccounting(CanonicalUsage()),
                 )
                 continue
+            if _reference_is_cooling_down(slot):
+                # Advisor still cooling down from a prior failure — skip the
+                # attempt entirely so a dead endpoint doesn't stall the turn.
+                results[idx] = (
+                    _slot_label(slot),
+                    _REFERENCE_COOLDOWN_NOTE,
+                    _RefAccounting(CanonicalUsage()),
+                )
+                continue
             futures[
                 executor.submit(
                     propagate_context_to_thread(_run_reference),
@@ -860,6 +913,7 @@ def _run_references_parallel(
                     temperature=temperature,
                     max_tokens=max_tokens,
                     reference_timeout=reference_timeout,
+                    reference_cooldown_seconds=reference_cooldown_seconds,
                     context_length_cache=_ctx_len_cache,
                     cache_disabled=cache_disabled,
                 )
@@ -1216,6 +1270,7 @@ def aggregate_moa_context(
     aggregator_temperature: float | None = None,
     reference_max_tokens: int | None = None,
     reference_timeout: float | None = None,
+    reference_cooldown_seconds: float = 0.0,
     degraded_reference_policy: str = "loud",
     agent: Any = None,
 ) -> str:
@@ -1250,6 +1305,7 @@ def aggregate_moa_context(
         temperature=temperature,
         max_tokens=reference_max_tokens,
         reference_timeout=reference_timeout,
+        reference_cooldown_seconds=reference_cooldown_seconds,
         agent=agent,
     )
 
@@ -1930,6 +1986,13 @@ class MoAChatCompletions:
         degraded_reference_policy = str(
             preset.get("degraded_reference_policy") or "loud"
         )
+        # Seconds a failed advisor is skipped before the fan-out tries it again
+        # (0 = disabled). Normalized by moa_config to a float (600s default).
+        raw_reference_cooldown = preset.get("reference_cooldown_seconds")
+        try:
+            reference_cooldown_seconds = float(raw_reference_cooldown or 0.0)
+        except (TypeError, ValueError):
+            reference_cooldown_seconds = 0.0
         if aggregator_temperature is None and api_kwargs.get("temperature") is not None:
             # The acting agent's own configured temperature (if any) still
             # applies to the aggregator, which IS the acting model.
@@ -2075,6 +2138,7 @@ class MoAChatCompletions:
                 max_tokens=reference_max_tokens,
                 progress_callback=_progress,
                 reference_timeout=reference_timeout,
+                reference_cooldown_seconds=reference_cooldown_seconds,
                 agent=self._agent,
                 late_accounting_sink=self._record_late_reference_accounting,
             )

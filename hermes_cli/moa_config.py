@@ -23,6 +23,11 @@ DEFAULT_MOA_AGGREGATOR: dict[str, str] = {
 
 DEFAULT_MOA_REFERENCE_TIMEOUT: float | None = None
 
+# Seconds a failing reference advisor stays "cooled down" (skipped by the
+# fan-out) before it is attempted again. 600s = 10 min. 0 disables the
+# cooldown (always attempt). In-memory only — resets on gateway restart.
+DEFAULT_MOA_REFERENCE_COOLDOWN_SECONDS: float = 600.0
+
 
 def _default_reference_models() -> list[dict[str, Any]]:
     return [{**slot, "enabled": True} for slot in deepcopy(DEFAULT_MOA_REFERENCE_MODELS)]
@@ -69,6 +74,25 @@ def _coerce_degraded_reference_policy(value: Any) -> str:
     """Normalize failed-advisor disclosure policy; unknown values fail loud."""
     policy = str(value or "loud").strip().lower()
     return policy if policy in {"loud", "silent"} else "loud"
+
+
+def _coerce_reference_cooldown(value: Any) -> float:
+    """Return the per-preset advisor cooldown in seconds (0 = disabled).
+
+    A failing reference advisor is skipped for this many seconds before the
+    fan-out attempts it again. ``None``/blank/bool falls back to the 600s
+    default; a negative or non-finite value also falls back to the default so
+    a malformed value can never silently disable the safeguard.
+    """
+    if value is None or value == "" or isinstance(value, bool):
+        return DEFAULT_MOA_REFERENCE_COOLDOWN_SECONDS
+    try:
+        cooldown = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_MOA_REFERENCE_COOLDOWN_SECONDS
+    if not math.isfinite(cooldown) or cooldown < 0:
+        return DEFAULT_MOA_REFERENCE_COOLDOWN_SECONDS
+    return cooldown
 
 
 def _coerce_int(value: Any, default: int) -> int:
@@ -303,6 +327,7 @@ def _default_preset() -> dict[str, Any]:
         "aggregator_temperature": None,
         "reference_timeout": DEFAULT_MOA_REFERENCE_TIMEOUT,
         "degraded_reference_policy": "loud",
+        "reference_cooldown_seconds": DEFAULT_MOA_REFERENCE_COOLDOWN_SECONDS,
         "max_tokens": 4096,
         "reference_max_tokens": None,
         "fanout": "user_turn",
@@ -342,6 +367,9 @@ def _normalize_preset(raw: Any) -> dict[str, Any]:
         "reference_timeout": _coerce_reference_timeout(raw.get("reference_timeout")),
         "degraded_reference_policy": _coerce_degraded_reference_policy(
             raw.get("degraded_reference_policy")
+        ),
+        "reference_cooldown_seconds": _coerce_reference_cooldown(
+            raw.get("reference_cooldown_seconds")
         ),
         "max_tokens": _coerce_int(raw.get("max_tokens"), 4096),
         # Optional cap on how much each reference ADVISOR may generate per turn.
@@ -412,6 +440,7 @@ def normalize_moa_config(raw: Any) -> dict[str, Any]:
         "aggregator_temperature": active["aggregator_temperature"],
         "reference_timeout": active["reference_timeout"],
         "degraded_reference_policy": active["degraded_reference_policy"],
+        "reference_cooldown_seconds": active["reference_cooldown_seconds"],
         "max_tokens": active["max_tokens"],
         "reference_max_tokens": active.get("reference_max_tokens"),
         "fanout": active.get("fanout", "user_turn"),
