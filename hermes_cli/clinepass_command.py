@@ -24,10 +24,37 @@ catalog model answered the probe correctly; latency, cost and whether the
 model actually modulates on reasoning_effort drove these choices):
 
     low     cline-pass/deepseek-v4-flash @ low     ~3s, cheapest paid tier
-    medium  cline-pass/deepseek-v4-pro   @ medium  quality step up, still fast
+    medium  cline-pass/minimax-m3        @ medium  balanced daily driver
     high    cline-pass/kimi-k3           @ high    flagship; effort-responsive
     xhigh   cline-pass/kimi-k3           @ xhigh   same flagship, deeper
     max     cline-pass/qwen3.7-max       @ max     strongest + priciest
+
+WHY medium IS NOT deepseek-v4-pro (changed 2026-08-22, later the same day,
+after a 7-prompt bake-off across arithmetic, code, instruction-following,
+tool-call shaping, counting, logic and bug-spotting):
+
+  * v4-pro is a runaway reasoner. On a trivial two-train arithmetic question
+    it burned 1746-1884 reasoning tokens; at max_tokens=2000 it truncated at
+    the cap, and at reasoning_effort=max it returned a hard
+    ``HTTP 500 {"error": "empty response content"}`` — reasoning had eaten
+    the entire budget, leaving nothing to send. A DEFAULT level that can 500
+    is not a default.
+  * minimax-m3 matched it answer-for-answer on all 7 prompts while running
+    2-5x faster (1.1-9.4s vs 1.8-19.7s) on a quarter of the tokens, and never
+    approached budget exhaustion.
+  * It also fixes the ladder: low->medium was a 3s -> 20s cliff, which is not
+    what "balanced daily driver" should mean.
+
+v4-pro is still one `/model cline-pass/deepseek-v4-pro` away; it is simply no
+longer what a bare level hands you.
+
+Two other measurements worth not re-deriving:
+
+  * deepseek-v4-flash ignores reasoning_effort entirely; kimi-k3 modulates
+    strongly (59 -> 169 reasoning tokens across the enum).
+  * qwen3.7-max modulates INVERSELY — max was leaner and faster than low
+    (991 tokens/15.2s vs 1348/24.2s). Harmless at the `max` level, but do not
+    read "max effort" there as "more thinking".
 
 ClinePass forwards to OpenRouter, whose reasoning_effort enum is exactly
 ``max|xhigh|high|medium|low|minimal|none`` — Hermes's own levels minus
@@ -43,7 +70,7 @@ CLINEPASS_PROVIDER = "cline"
 # Ordered lowest → highest capability. Values are (model_id, effort).
 CLINEPASS_LEVELS: dict[str, tuple[str, str]] = {
     "low": ("cline-pass/deepseek-v4-flash", "low"),
-    "medium": ("cline-pass/deepseek-v4-pro", "medium"),
+    "medium": ("cline-pass/minimax-m3", "medium"),
     "high": ("cline-pass/kimi-k3", "high"),
     "xhigh": ("cline-pass/kimi-k3", "xhigh"),
     "max": ("cline-pass/qwen3.7-max", "max"),
