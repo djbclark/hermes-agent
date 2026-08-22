@@ -69,10 +69,16 @@ def is_free_model(model_name: str, *, provider: str = "", model_info: Optional[M
             info = get_model_info("opencode", model_name)
         except Exception:
             info = None
-    if info is None or not info.has_cost_data():
+    if info is None:
         return False
+    # Check if all known costs are explicitly zero (verified free)
+    # We don't use has_cost_data() here because it returns False for free models (all costs = 0)
     costs = (info.cost_input, info.cost_output, info.cost_cache_read, info.cost_cache_write)
     try:
+        # Verify we have cost data (not None) and all are zero
+        has_any_cost_data = any(v is not None for v in costs)
+        if not has_any_cost_data:
+            return False
         return all(Decimal(str(value or 0)) == 0 for value in costs)
     except (InvalidOperation, ValueError, TypeError):
         return False
