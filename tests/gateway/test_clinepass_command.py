@@ -45,12 +45,15 @@ def _make_runner(switch_succeeds=True, switch_reply="switched!", picker_availabl
 
     runner._pickers = []
 
-    async def _fake_picker(event, session_key, title, choices, on_choice_selected):
+    async def _fake_picker(
+        event, session_key, title, choices, on_choice_selected, full_width=False
+    ):
         runner._pickers.append(
             {
                 "title": title,
                 "choices": choices,
                 "on_choice_selected": on_choice_selected,
+                "full_width": full_width,
             }
         )
         return picker_available
@@ -87,6 +90,10 @@ def test_bare_invocation_opens_picker_and_changes_nothing_yet():
     assert reply is None
     assert runner._model_events == []
     assert runner._reasoning_calls == []
+
+    # The level labels are long ("level · model @ effort"), so the picker
+    # requests one full-width button per row on keyboard platforms.
+    assert runner._pickers[0]["full_width"] is True
 
     choices = runner._pickers[0]["choices"]
     assert [c["value"] for c in choices] == list(CLINEPASS_LEVELS)

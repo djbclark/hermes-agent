@@ -2768,11 +2768,14 @@ class MatrixAdapter(BasePlatformAdapter):
         session_key: str,
         on_choice_selected,
         metadata: Optional[Dict[str, Any]] = None,
+        full_width: bool = False,
     ) -> SendResult:
         """Send a Matrix reaction-based choice picker (/reasoning, /fast).
 
         Generic single-level companion to ``send_model_picker``. Each choice
         dict: ``{"value": str, "label": str, "is_current": bool}``.
+        ``full_width`` is a row-layout hint for keyboard platforms; the
+        reaction picker renders text lines, so it is accepted and ignored.
         """
         if not self._client:
             return SendResult(success=False, error="Not connected")

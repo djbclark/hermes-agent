@@ -7435,12 +7435,15 @@ class DiscordAdapter(BasePlatformAdapter):
         session_key: str,
         on_choice_selected,
         metadata: Optional[Dict[str, Any]] = None,
+        full_width: bool = False,
     ) -> SendResult:
         """Send a flat select-menu choice picker (one selection → one value).
 
         Generic single-level companion to ``send_model_picker`` used by
         `/reasoning`, `/fast`, and any future finite-choice command. Each
         choice dict: ``{"value": str, "label": str, "is_current": bool}``.
+        ``full_width`` is a row-layout hint for keyboard platforms; a select
+        menu has no row concept, so it is accepted and ignored here.
         """
         if not self._client or not DISCORD_AVAILABLE:
             return SendResult(success=False, error="Not connected")

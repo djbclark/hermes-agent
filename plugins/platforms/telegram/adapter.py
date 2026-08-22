@@ -5958,12 +5958,15 @@ class TelegramAdapter(BasePlatformAdapter):
         session_key: str,
         on_choice_selected,
         metadata: Optional[Dict[str, Any]] = None,
+        full_width: bool = False,
     ) -> SendResult:
         """Send a flat inline-keyboard choice picker (one tap → one value).
 
         Generic single-level companion to ``send_model_picker`` used by
         `/reasoning`, `/fast`, and any future finite-choice command. Each
         choice dict: ``{"value": str, "label": str, "is_current": bool}``.
+        ``full_width`` puts each button on its own row so long labels get the
+        whole message width instead of sharing it two-up.
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
@@ -5979,10 +5982,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             if not buttons:
                 return SendResult(success=False, error="No choices")
-            # Two buttons per row keeps labels readable on mobile.
-            keyboard = InlineKeyboardMarkup(
-                [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
-            )
+            # Two buttons per row keeps labels readable on mobile; pickers
+            # with long labels opt into one full-width button per row.
+            if full_width:
+                keyboard = InlineKeyboardMarkup([[b] for b in buttons])
+            else:
+                keyboard = InlineKeyboardMarkup(
+                    [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+                )
 
             thread_id = metadata.get("thread_id") if metadata else None
             reply_to_id = self._reply_to_message_id_for_send(None, metadata, reply_to_mode=self._reply_to_mode)

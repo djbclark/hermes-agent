@@ -86,6 +86,8 @@ class TestReasoningChoicePicker:
         assert values[0] == "none"
         assert values[1:1 + len(VALID_REASONING_EFFORTS)] == list(VALID_REASONING_EFFORTS)
         assert values[-3:] == ["reset", "show", "hide"]
+        # /reasoning keeps the compact two-up layout (9+ short choices).
+        assert call["full_width"] is False
 
 
     @pytest.mark.asyncio
@@ -127,6 +129,8 @@ class TestFastChoicePicker:
         assert result is None
         values = [c["value"] for c in adapter.calls[0]["choices"]]
         assert values == ["fast", "normal"]
+        # /fast keeps the compact two-up layout (two short choices).
+        assert adapter.calls[0]["full_width"] is False
 
     @pytest.mark.asyncio
     async def test_fast_picker_selection_is_session_scoped(self, tmp_path, monkeypatch):

@@ -3466,12 +3466,16 @@ class GatewaySlashCommandsMixin:
         title: str,
         choices: list,
         on_choice_selected,
+        full_width: bool = False,
     ) -> bool:
         """Send an interactive choice picker when the platform supports it.
 
         Mirrors the `/model` picker gate: the capability is detected on the
         adapter *type* (``send_choice_picker``), and a failed send falls back
         to the text path (returns False) instead of erroring the command.
+
+        ``full_width`` lays each choice out on its own row where the platform
+        has a row concept (Telegram); other platforms ignore it.
         """
         adapter = getattr(self, "_adapter_for_source")(event.source)
         has_picker = (
@@ -3491,6 +3495,7 @@ class GatewaySlashCommandsMixin:
                 session_key=session_key,
                 on_choice_selected=on_choice_selected,
                 metadata=metadata,
+                full_width=full_width,
             )
             return bool(getattr(result, "success", False))
         except Exception as e:
@@ -3545,6 +3550,7 @@ class GatewaySlashCommandsMixin:
                 title=picker_title(current_model, current_effort),
                 choices=picker_choices(current_model, current_effort),
                 on_choice_selected=_on_clinepass_choice,
+                full_width=True,
             )
             if picker_sent:
                 return None  # Picker sent — adapter handles the response
