@@ -434,6 +434,81 @@ class TestValidateApiFallback:
         assert "401" in result["message"]
         assert "LM_API_KEY" in result["message"]
 
+    def _cline_provider_cfg(self, discover_models=False):
+        return {
+            "provider_key": "cline",
+            "name": "Cline",
+            "base_url": "https://api.cline.bot/api/v1",
+            "discover_models": discover_models,
+            "models": {
+                "cline-pass/minimax-m3": {},
+                "cline-pass/kimi-k3": {},
+            },
+        }
+
+    def test_discover_models_false_skips_live_probe_for_known_model(self):
+        """ClinePass (and similar providers with no /models endpoint) must
+        validate against the configured ``models:`` list instead of
+        live-probing — regression for the "could not reach the cline API"
+        warning firing on every /clinepass switch even though the model works.
+        """
+        with patch(
+            "hermes_cli.config.get_compatible_custom_providers",
+            return_value=[self._cline_provider_cfg()],
+        ), patch(
+            "hermes_cli.models.fetch_api_models",
+            side_effect=AssertionError("must not probe a provider with discover_models: false"),
+        ):
+            result = validate_requested_model(
+                "cline-pass/minimax-m3",
+                "cline",
+                api_key="x",
+                base_url="https://api.cline.bot/api/v1",
+            )
+
+        assert result == {
+            "accepted": True,
+            "persist": True,
+            "recognized": True,
+            "message": None,
+        }
+
+    def test_discover_models_false_warns_but_accepts_unknown_model(self):
+        with patch(
+            "hermes_cli.config.get_compatible_custom_providers",
+            return_value=[self._cline_provider_cfg()],
+        ), patch(
+            "hermes_cli.models.fetch_api_models",
+            side_effect=AssertionError("must not probe a provider with discover_models: false"),
+        ):
+            result = validate_requested_model(
+                "cline-pass/totally-bogus",
+                "cline",
+                api_key="x",
+                base_url="https://api.cline.bot/api/v1",
+            )
+
+        assert result["accepted"] is True
+        assert result["persist"] is True
+        assert result["recognized"] is False
+        assert "not found in the configured" in result["message"]
+
+    def test_discover_models_true_still_live_probes(self):
+        """Providers that don't opt out of discovery keep the existing
+        live-probe fallback behavior untouched."""
+        cfg = self._cline_provider_cfg(discover_models=True)
+        with patch(
+            "hermes_cli.config.get_compatible_custom_providers", return_value=[cfg]
+        ), patch("hermes_cli.models.fetch_api_models", return_value=None):
+            result = validate_requested_model(
+                "cline-pass/minimax-m3",
+                "cline",
+                api_key="x",
+                base_url="https://api.cline.bot/api/v1",
+            )
+
+        assert result["accepted"] is True
+        assert "could not reach the" in result["message"]
 
 
 # -- validate — Codex auto-correction ------------------------------------------

@@ -5327,6 +5327,79 @@ def validate_requested_model(
             ),
         }
 
+    # Respect ``discover_models: false``. Some providers' real APIs have no
+    # /models endpoint at all (e.g. ClinePass at api.cline.bot returns 404),
+    # so the live probe below would always fail and fall through to the
+    # generic "could not reach the API" warning even though the model works
+    # fine. When the provider config disables discovery and ships an
+    # explicit ``models:`` list, validate directly against that list and
+    # skip the doomed live probe — same semantics as the picker paths
+    # (model_switch.py sections 3 & 4, model_setup_flows._model_flow_named_custom).
+    try:
+        from hermes_cli.config import get_compatible_custom_providers
+
+        _provider_cfg = next(
+            (
+                p
+                for p in get_compatible_custom_providers()
+                if str(p.get("provider_key", "")).strip().lower() == normalized
+            ),
+            None,
+        )
+    except Exception:
+        _provider_cfg = None
+    if _provider_cfg is not None and _provider_cfg.get("discover_models") is False:
+        configured_models = [
+            str(m) for m in (_provider_cfg.get("models") or {}) if str(m).strip()
+        ]
+        if configured_models:
+            configured_lower = {m.lower(): m for m in configured_models}
+            if requested_for_lookup.lower() in configured_lower:
+                return {
+                    "accepted": True,
+                    "persist": True,
+                    "recognized": True,
+                    "message": None,
+                }
+            auto = get_close_matches(
+                requested_for_lookup.lower(), list(configured_lower.keys()), n=1, cutoff=0.9
+            )
+            if auto:
+                corrected = configured_lower[auto[0]]
+                return {
+                    "accepted": True,
+                    "persist": True,
+                    "recognized": True,
+                    "corrected_model": corrected,
+                    "message": f"Auto-corrected `{requested}` → `{corrected}`",
+                }
+            suggestions = get_close_matches(
+                requested_for_lookup.lower(), list(configured_lower.keys()), n=3, cutoff=0.5
+            )
+            suggestion_text = ""
+            if suggestions:
+                suggestion_text = "\n  Similar models: " + ", ".join(
+                    f"`{configured_lower[s]}`" for s in suggestions
+                )
+            return {
+                "accepted": True,
+                "persist": True,
+                "recognized": False,
+                "message": (
+                    f"Note: `{requested}` was not found in the configured "
+                    f"`models:` list for this provider.{suggestion_text}"
+                ),
+            }
+        # discover_models: false but no explicit list to check against —
+        # the live probe would still be doomed, so accept quietly instead
+        # of scaring the user with an "unreachable API" warning.
+        return {
+            "accepted": True,
+            "persist": True,
+            "recognized": False,
+            "message": None,
+        }
+
     # Probe the live API to check if the model actually exists
     api_models = fetch_api_models(api_key, base_url)
 
