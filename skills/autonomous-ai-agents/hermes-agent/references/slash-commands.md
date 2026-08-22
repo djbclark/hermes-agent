@@ -36,7 +36,7 @@ it. New commands land often; `/help` in-session is always authoritative.
 ```
 /config                  Show config (CLI)
 /model [name] [--global] Switch model (session-scoped by default)
-/clinepass [level]       Switch to ClinePass at a level (low..max: model + effort)
+/clinepass [level]       Switch to ClinePass at a level (low..max: model + effort; bare = picker)
 /personality [name]      Set a personality
 /reasoning [level|show|hide] Reasoning effort/display (none..xhigh|max|ultra)
 /fast [normal|fast]      Priority/fast processing tier

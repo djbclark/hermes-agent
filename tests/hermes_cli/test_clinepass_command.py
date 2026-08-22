@@ -4,7 +4,11 @@ from hermes_cli.clinepass_command import (
     CLINEPASS_LEVELS,
     CLINEPASS_PROVIDER,
     DEFAULT_CLINEPASS_LEVEL,
+    level_label,
     parse_clinepass_args,
+    picker_choices,
+    picker_title,
+    short_model,
     status_text,
     usage_text,
 )
@@ -94,3 +98,48 @@ def test_command_is_registered():
     cmd = matches[0]
     assert not cmd.cli_only and not cmd.gateway_only
     assert set(cmd.subcommands) == set(CLINEPASS_LEVELS)
+
+
+def test_bare_invocation_is_not_explicit():
+    """Bare /clinepass must be distinguishable from an explicit level so
+    picker-capable surfaces can offer the list instead of applying a default."""
+    assert parse_clinepass_args("").explicit is False
+    assert parse_clinepass_args("  --global ").explicit is False
+    assert parse_clinepass_args("medium").explicit is True
+
+
+def test_short_model_drops_the_shared_namespace():
+    assert short_model("cline-pass/kimi-k3") == "kimi-k3"
+    assert short_model("kimi-k3") == "kimi-k3"
+
+
+def test_level_label_carries_level_model_and_effort():
+    for level, (model, effort) in CLINEPASS_LEVELS.items():
+        label = level_label(level)
+        assert label.startswith(level)
+        assert short_model(model) in label
+        assert label.endswith(f"@ {effort}")
+        assert "cline-pass/" not in label
+
+
+def test_picker_choices_cover_every_level_in_order():
+    choices = picker_choices()
+    assert [c["value"] for c in choices] == list(CLINEPASS_LEVELS)
+    assert all(c["is_current"] is False for c in choices)
+
+
+def test_picker_current_needs_both_model_and_effort():
+    """high and xhigh share a model — effort is what separates them."""
+    model, _ = CLINEPASS_LEVELS["xhigh"]
+    choices = {c["value"]: c["is_current"] for c in picker_choices(model, "xhigh")}
+    assert choices["xhigh"] is True
+    assert choices["high"] is False
+
+    # Same model at neither level's effort marks nothing current.
+    assert not any(picker_choices(model, "low")[i]["is_current"] for i in range(5))
+
+
+def test_picker_title_reports_current_and_default():
+    assert DEFAULT_CLINEPASS_LEVEL in picker_title()
+    assert "cline-pass/kimi-k3" in picker_title("cline-pass/kimi-k3", "high")
+    assert "not a ClinePass model" in picker_title("gpt-5.5", "high")

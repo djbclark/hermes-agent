@@ -4,7 +4,9 @@
 (``cline``) at a chosen capability level, setting BOTH the model and the
 reasoning effort in one step:
 
-    /clinepass              — balanced default (same as /clinepass medium)
+    /clinepass              — interactive level picker on platforms that
+                              support one (Telegram/Discord/Matrix); the
+                              balanced default (medium) on the CLI
     /clinepass low          — fastest / cheapest
     /clinepass medium       — balanced daily driver
     /clinepass high         — flagship model, high effort
@@ -52,13 +54,20 @@ DEFAULT_CLINEPASS_LEVEL = "medium"
 
 @dataclass(frozen=True)
 class ClinePassRequest:
-    """Parsed ``/clinepass`` arguments."""
+    """Parsed ``/clinepass`` arguments.
+
+    ``explicit`` is False when the user named no level (bare ``/clinepass``,
+    with or without flags). Surfaces that can render an interactive picker
+    use it to offer the level list instead of silently applying the default;
+    surfaces that cannot fall back to ``level`` (the default level).
+    """
 
     level: str
     model: str
     effort: str
     persist_global: bool
     error: str | None = None
+    explicit: bool = True
 
 
 def usage_text() -> str:
@@ -88,8 +97,10 @@ def parse_clinepass_args(raw: str) -> ClinePassRequest:
     # --session accepted as an explicit no-op for parity with /model.
     levels = [t for t in tokens if t not in ("--global", "--session")]
 
+    explicit = True
     if not levels:
         level = DEFAULT_CLINEPASS_LEVEL
+        explicit = False
     elif len(levels) == 1 and levels[0] in CLINEPASS_LEVELS:
         level = levels[0]
     else:
@@ -105,5 +116,65 @@ def parse_clinepass_args(raw: str) -> ClinePassRequest:
 
     model, effort = CLINEPASS_LEVELS[level]
     return ClinePassRequest(
-        level=level, model=model, effort=effort, persist_global=persist_global
+        level=level,
+        model=model,
+        effort=effort,
+        persist_global=persist_global,
+        explicit=explicit,
+    )
+
+
+def short_model(model: str) -> str:
+    """Drop the shared ``cline-pass/`` namespace for compact UI labels."""
+    return model.split("/", 1)[-1] if "/" in model else model
+
+
+def level_label(level: str) -> str:
+    """One-line ``level · model @ effort`` label for a picker button.
+
+    Every level maps to a different model *and* effort, so the label has to
+    carry both — a bare ``high`` tells the operator nothing about which model
+    or how hard it will think. The ``cline-pass/`` prefix is dropped because
+    it is identical for all five and would eat the button width that the
+    distinguishing part needs.
+    """
+    model, effort = CLINEPASS_LEVELS[level]
+    return f"{level} · {short_model(model)} @ {effort}"
+
+
+def picker_choices(
+    current_model: str = "", current_effort: str = ""
+) -> list[dict]:
+    """Choice dicts for the generic ``send_choice_picker`` adapter contract.
+
+    ``is_current`` requires BOTH the model and the effort to match, since two
+    levels (``high``/``xhigh``) share a model and differ only by effort.
+    """
+    choices = []
+    for level, (model, effort) in CLINEPASS_LEVELS.items():
+        choices.append(
+            {
+                "value": level,
+                "label": level_label(level),
+                "is_current": bool(current_model)
+                and current_model == model
+                and current_effort == effort,
+            }
+        )
+    return choices
+
+
+def picker_title(current_model: str = "", current_effort: str = "") -> str:
+    """Title card shown above the picker (first line is the embed title on
+    Discord, so it must stand alone)."""
+    if current_model and current_model.startswith("cline-pass/"):
+        current = f"`{current_model}` @ `{current_effort or 'default'}`"
+    elif current_model:
+        current = f"`{current_model}` (not a ClinePass model)"
+    else:
+        current = "_config default_"
+    return (
+        "🎚️ **ClinePass levels**\n"
+        f"\n**Current:** {current}\n"
+        f"\nPick a level (default is `{DEFAULT_CLINEPASS_LEVEL}`):"
     )

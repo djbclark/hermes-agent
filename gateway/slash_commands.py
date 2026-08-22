@@ -3500,6 +3500,93 @@ class GatewaySlashCommandsMixin:
     async def _handle_clinepass_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /clinepass — switch to ClinePass at a capability level.
 
+        Bare `/clinepass` opens the interactive level picker on platforms that
+        support one (same gate as `/model`, `/reasoning` and `/fast`), falling
+        back to the text level table elsewhere — it does NOT silently apply the
+        default level, so a tap is always an informed choice. A named level
+        applies directly.
+
+        Applying is a thin composition of the existing plumbing: see
+        `_apply_clinepass_level`.
+        """
+        from hermes_cli.clinepass_command import (
+            parse_clinepass_args,
+            picker_choices,
+            picker_title,
+            status_text,
+        )
+
+        raw_args = event.get_command_args().strip()
+        if raw_args.lower() in {"help", "levels", "list"}:
+            return status_text()
+
+        request = parse_clinepass_args(raw_args)
+        if request.error:
+            return f"❌ {request.error}"
+
+        if not request.explicit:
+            _source = await asyncio.to_thread(
+                self._normalize_source_for_session_key, event.source
+            )
+            session_key = self._session_key_for_source(_source)
+            current_model, current_effort = self._current_clinepass_selection(
+                event, session_key
+            )
+            _persist = request.persist_global
+
+            async def _on_clinepass_choice(_chat_id: str, value: str) -> str:
+                return await self._apply_clinepass_level(
+                    event, value, persist_global=_persist
+                )
+
+            picker_sent = await self._try_send_choice_picker(
+                event,
+                session_key,
+                title=picker_title(current_model, current_effort),
+                choices=picker_choices(current_model, current_effort),
+                on_choice_selected=_on_clinepass_choice,
+            )
+            if picker_sent:
+                return None  # Picker sent — adapter handles the response
+            return status_text()
+
+        return await self._apply_clinepass_level(
+            event, request.level, persist_global=request.persist_global
+        )
+
+    def _current_clinepass_selection(
+        self, event: MessageEvent, session_key: str
+    ) -> tuple:
+        """Best-effort (model, effort) for this session, for picker highlighting.
+
+        Purely cosmetic — a resolution failure must not stop the picker from
+        rendering, so every lookup is guarded and degrades to "unknown".
+        """
+        current_model = str(
+            ((getattr(self, "_session_model_overrides", {}) or {}).get(session_key) or {}).get("model")
+            or ""
+        )
+        current_effort = ""
+        try:
+            rc = self._resolve_session_reasoning_config(
+                source=event.source, session_key=session_key, model=current_model
+            )
+            if rc is not None:
+                current_effort = (
+                    "none" if rc.get("enabled") is False else str(rc.get("effort") or "")
+                )
+        except Exception as e:  # pragma: no cover - cosmetic path
+            logger.debug("clinepass picker: effort lookup failed: %s", e)
+        return current_model, current_effort
+
+    async def _apply_clinepass_level(
+        self, event: MessageEvent, level: str, persist_global: bool = False
+    ) -> str:
+        """Apply one ClinePass level (typed or picked) and return the reply.
+
+        Single application path shared by the typed `/clinepass <level>` branch
+        and the interactive picker, mirroring `_apply_reasoning_selection`.
+
         Thin composition of the existing plumbing: resolves the level to a
         (model, effort) pair from hermes_cli.clinepass_command, delegates the
         model switch to _handle_model_command via a synthetic /model event
@@ -3513,7 +3600,9 @@ class GatewaySlashCommandsMixin:
         from gateway.run import _platform_config_key
         from hermes_cli.clinepass_command import parse_clinepass_args
 
-        request = parse_clinepass_args(event.get_command_args())
+        request = parse_clinepass_args(
+            f"{level} --global" if persist_global else level
+        )
         if request.error:
             return f"❌ {request.error}"
 
