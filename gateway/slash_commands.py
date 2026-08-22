@@ -3497,6 +3497,61 @@ class GatewaySlashCommandsMixin:
             logger.warning("send_choice_picker failed, falling back to text: %s", e)
             return False
 
+    async def _handle_clinepass_command(self, event: MessageEvent) -> Optional[str]:
+        """Handle /clinepass — switch to ClinePass at a capability level.
+
+        Thin composition of the existing plumbing: resolves the level to a
+        (model, effort) pair from hermes_cli.clinepass_command, delegates the
+        model switch to _handle_model_command via a synthetic /model event
+        (so session overrides, DB write-through, switch notes and agent
+        eviction all behave exactly like /model), then applies the effort
+        through the same applier /reasoning uses. Session-scoped by default;
+        --global persists both the model and the effort to config.yaml.
+        """
+        import dataclasses
+
+        from gateway.run import _platform_config_key
+        from hermes_cli.clinepass_command import parse_clinepass_args
+
+        request = parse_clinepass_args(event.get_command_args())
+        if request.error:
+            return f"❌ {request.error}"
+
+        flags = " --global" if request.persist_global else ""
+        model_event = dataclasses.replace(
+            event, text=f"/model {request.model} --provider cline{flags}"
+        )
+        switch_reply = await self._handle_model_command(model_event)
+
+        # Confirm the switch actually landed before touching reasoning:
+        # a failed switch stores no session override, and its reply text is
+        # localized (not reliably prefix-matchable).
+        _source = await asyncio.to_thread(
+            self._normalize_source_for_session_key, event.source
+        )
+        session_key = self._session_key_for_source(_source)
+        applied = (
+            (self._session_model_overrides.get(session_key) or {}).get("model")
+            == request.model
+        )
+        if not applied:
+            return switch_reply
+
+        platform_key = _platform_config_key(event.source.platform)
+        effort_reply = self._apply_reasoning_selection(
+            session_key,
+            platform_key,
+            request.effort,
+            persist_global=request.persist_global,
+        )
+        header = (
+            f"🎚️ ClinePass level `{request.level}` → "
+            f"`{request.model}` @ `{request.effort}`"
+        )
+        return "\n".join(
+            part for part in (header, switch_reply, effort_reply) if part
+        )
+
     async def _handle_reasoning_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /reasoning command — manage reasoning effort and display toggle.
 

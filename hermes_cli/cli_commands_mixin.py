@@ -3259,6 +3259,46 @@ class CLICommandsMixin:
         else:
             _cprint("  Failed to save timestamps setting to config.yaml")
 
+    def _handle_clinepass_command(self, cmd: str):
+        """Handle /clinepass — switch to ClinePass at a capability level.
+
+        Usage:
+            /clinepass                 Balanced default (same as /clinepass medium)
+            /clinepass <level>         low | medium | high | xhigh | max
+            /clinepass <level> --global  Persist model + effort to config.yaml
+
+        Thin composition of /model and /reasoning: the level resolves to a
+        (model, effort) pair in hermes_cli.clinepass_command, the switch is
+        delegated to _handle_model_switch, and the effort to
+        _handle_reasoning_command — so scope semantics, error copy, and
+        agent re-init behave exactly like those commands.
+        """
+        from cli import _ACCENT, _DIM, _RST, _cprint
+        from hermes_cli.clinepass_command import parse_clinepass_args, status_text
+
+        parts = cmd.strip().split(maxsplit=1)
+        raw_args = parts[1] if len(parts) > 1 else ""
+        if raw_args.strip().lower() in {"help", "levels", "list"}:
+            for line in status_text().splitlines():
+                _cprint(f"  {_DIM}{line}{_RST}")
+            return
+        request = parse_clinepass_args(raw_args)
+        if request.error:
+            _cprint(f"  ✗ {request.error}")
+            return
+
+        flags = " --global" if request.persist_global else ""
+        self._handle_model_switch(f"/model {request.model} --provider cline{flags}")
+        if self.model != request.model:
+            # Switch failed — _handle_model_switch already printed why.
+            # Leave reasoning untouched so a failed /clinepass is a no-op.
+            return
+        self._handle_reasoning_command(f"/reasoning {request.effort}{flags}")
+        _cprint(
+            f"  {_ACCENT}🎚️ ClinePass level '{request.level}' active: "
+            f"{request.model} @ {request.effort}{_RST}"
+        )
+
     def _handle_reasoning_command(self, cmd: str):
         """Handle /reasoning — manage effort level and display toggle.
 

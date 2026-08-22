@@ -198,6 +198,11 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("model", "Switch model (session-scoped; --global to persist)", "Configuration",
                args_hint="[model] [--provider name] [--global|--session] [--refresh]",
                busy_policy="reject", busy_handler="model"),
+    CommandDef("clinepass", "Switch to ClinePass at a capability level (model + reasoning effort)",
+               "Configuration",
+               args_hint="[low|medium|high|xhigh|max] [--global]",
+               subcommands=("low", "medium", "high", "xhigh", "max"),
+               busy_policy="reject", busy_handler="model"),
     CommandDef("codex-runtime", "Toggle codex app-server runtime for OpenAI/Codex models",
                "Configuration", aliases=("codex_runtime",),
                args_hint="[auto|codex_app_server]",
@@ -1279,7 +1284,11 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     native slash.
 #   - pause: global emergency stop; reached via /hermes pause [off] on
 #     Slack. Added at the 50-cap — a native slot would clamp /platform.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause"})
+#   - aiuse: informational usage dump; reached via /hermes aiuse on Slack.
+#     Added at the 50-cap — a native slot would clamp /insights.
+#   - clinepass: ClinePass level switcher; reached via /hermes clinepass on
+#     Slack. Added at the 50-cap — a native slot would clamp /platform.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause", "aiuse", "clinepass"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

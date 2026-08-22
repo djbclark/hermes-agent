@@ -7142,6 +7142,12 @@ class AIAgent:
             return True
         if base_url_host_matches(self._base_url_lower, "ai-gateway.vercel.sh"):
             return True
+        # ClinePass forwards to OpenRouter, which accepts the reasoning
+        # object for the whole cline-pass/ catalog (all reasoning-capable);
+        # verified live 2026-08-22 with both reasoning_effort and
+        # extra_body.reasoning shapes.
+        if base_url_host_matches(self._base_url_lower, "cline.bot"):
+            return True
         if (
             base_url_host_matches(self._base_url_lower, "models.github.ai")
             or base_url_host_matches(self._base_url_lower, "githubcopilot.com")

@@ -192,6 +192,7 @@ platform network disconnect as an event-loop failure.
 |---------|-------------|
 | `/new` or `/reset` | Start a fresh conversation |
 | `/model [provider:model]` | Show or change the model (supports `provider:model` syntax) |
+| `/clinepass [low\|medium\|high\|xhigh\|max]` | Switch to ClinePass at a capability level — sets both the model and reasoning effort (`--global` to persist) |
 | `/personality [name]` | Set a personality (`none` to reset) |
 | `/retry` | Retry the last message |
 | `/undo` | Remove the last exchange |

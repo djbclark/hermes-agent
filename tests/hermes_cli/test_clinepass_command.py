@@ -1,0 +1,96 @@
+"""Tests for the /clinepass level parser and mapping invariants."""
+
+from hermes_cli.clinepass_command import (
+    CLINEPASS_LEVELS,
+    CLINEPASS_PROVIDER,
+    DEFAULT_CLINEPASS_LEVEL,
+    parse_clinepass_args,
+    status_text,
+    usage_text,
+)
+
+# ClinePass forwards to OpenRouter; this is OpenRouter's reasoning_effort
+# enum (verified live 2026-08-22 via a 400 on an invalid option).
+_CLINEPASS_EFFORT_ENUM = {"max", "xhigh", "high", "medium", "low", "minimal", "none"}
+
+
+def test_provider_is_cline():
+    assert CLINEPASS_PROVIDER == "cline"
+
+
+def test_levels_cover_the_requested_ladder_in_order():
+    assert list(CLINEPASS_LEVELS) == ["low", "medium", "high", "xhigh", "max"]
+
+
+def test_every_level_maps_to_catalog_model_and_valid_effort():
+    for level, (model, effort) in CLINEPASS_LEVELS.items():
+        assert model.startswith("cline-pass/"), (level, model)
+        assert effort in _CLINEPASS_EFFORT_ENUM, (level, effort)
+
+
+def test_default_level_is_a_known_level():
+    assert DEFAULT_CLINEPASS_LEVEL in CLINEPASS_LEVELS
+
+
+def test_bare_invocation_resolves_default_level():
+    request = parse_clinepass_args("")
+    assert request.error is None
+    assert request.level == DEFAULT_CLINEPASS_LEVEL
+    assert (request.model, request.effort) == CLINEPASS_LEVELS[DEFAULT_CLINEPASS_LEVEL]
+    assert request.persist_global is False
+
+
+def test_each_level_parses_to_its_mapping():
+    for level, (model, effort) in CLINEPASS_LEVELS.items():
+        request = parse_clinepass_args(level)
+        assert request.error is None
+        assert (request.level, request.model, request.effort) == (level, model, effort)
+
+
+def test_level_parsing_is_case_insensitive():
+    request = parse_clinepass_args("HIGH")
+    assert request.error is None
+    assert request.level == "high"
+
+
+def test_global_flag_with_and_without_level():
+    assert parse_clinepass_args("--global").persist_global is True
+    assert parse_clinepass_args("--global").level == DEFAULT_CLINEPASS_LEVEL
+    request = parse_clinepass_args("max --global")
+    assert request.persist_global is True
+    assert request.level == "max"
+
+
+def test_session_flag_is_accepted_noop():
+    request = parse_clinepass_args("low --session")
+    assert request.error is None
+    assert request.level == "low"
+    assert request.persist_global is False
+
+
+def test_unknown_level_returns_error():
+    request = parse_clinepass_args("ludicrous")
+    assert request.error is not None
+    assert "ludicrous" in request.error
+    assert usage_text() in request.error
+
+
+def test_multiple_levels_return_error():
+    assert parse_clinepass_args("low high").error is not None
+
+
+def test_status_text_lists_every_level():
+    text = status_text()
+    for level, (model, _effort) in CLINEPASS_LEVELS.items():
+        assert level in text
+        assert model in text
+
+
+def test_command_is_registered():
+    from hermes_cli.commands import COMMAND_REGISTRY
+
+    matches = [c for c in COMMAND_REGISTRY if c.name == "clinepass"]
+    assert len(matches) == 1
+    cmd = matches[0]
+    assert not cmd.cli_only and not cmd.gateway_only
+    assert set(cmd.subcommands) == set(CLINEPASS_LEVELS)
