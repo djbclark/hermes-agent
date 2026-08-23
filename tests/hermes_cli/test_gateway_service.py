@@ -1341,7 +1341,8 @@ class TestProfileArg:
             "mybot",
             "gateway",
             "run",
-            "--replace",
+            # No --replace: launchd must not run gateway takeover logic on
+            # every respawn (test_launchd_plist_omits_replace_flag).
             "--external-supervisor",
         ]
 

@@ -125,9 +125,11 @@ class TestRuntimeProviderKeylessRouting:
         assert rt["base_url"] == "https://opencode.ai/zen/v1"
 
     def test_paid_model_still_fails_closed_without_key(self):
-        from hermes_cli.auth import AuthError
-
-        with pytest.raises(AuthError):
+        # The fork's free-only policy gate fires before credential
+        # resolution, so a paid Zen model is blocked with the policy error
+        # (ValueError) rather than reaching the AuthError path — still
+        # fail-closed, just earlier (see model_cost_guard.is_free_model).
+        with pytest.raises(ValueError, match="free-only policy"):
             self._resolve("opencode-zen", "claude-sonnet-5")
 
 

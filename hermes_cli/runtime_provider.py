@@ -1821,9 +1821,15 @@ def resolve_runtime_provider(
         _target = target_model or str(_model_cfg.get("default") or "").strip()
         _config_override = bool(_model_cfg.get("allow_paid_opencode_zen", False))
         if not _config_override:
-            from hermes_cli.model_cost_guard import is_free_model, opencode_zen_policy_error
-            if not is_free_model(_target, provider="opencode-zen"):
-                raise ValueError(opencode_zen_policy_error(_target))
+            # A model in the VERIFIED keyless catalog routes anonymously on
+            # the Zen relay (opencode_zen_free_runtime) — it cannot spend, so
+            # the free-only policy admits it even when models.dev carries no
+            # pricing row for it. Everything else still fails closed.
+            from hermes_cli.models import opencode_zen_free_runtime
+            if opencode_zen_free_runtime("opencode-zen", _target) is None:
+                from hermes_cli.model_cost_guard import is_free_model, opencode_zen_policy_error
+                if not is_free_model(_target, provider="opencode-zen"):
+                    raise ValueError(opencode_zen_policy_error(_target))
     _provs_cfg = _full_cfg.get("providers") if isinstance(_full_cfg, dict) else None
     if isinstance(_provs_cfg, dict):
         _block = _provs_cfg.get(requested_provider)
