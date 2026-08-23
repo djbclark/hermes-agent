@@ -98,14 +98,14 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # ─── Inference providers ───────────────────────────────────────────────
     # Native Anthropic SDK — needed when provider=anthropic (not via
     # OpenRouter / aggregators which use the openai SDK).
-    "provider.anthropic": ("anthropic==0.87.0",),  # CVE-2026-34450, CVE-2026-34452
+    "provider.anthropic": ("anthropic==0.121.0",),  # CVE-2026-34450, CVE-2026-34452
     # AWS Bedrock provider
-    "provider.bedrock": ("boto3==1.42.89",),
+    "provider.bedrock": ("boto3==1.43.67",),
     # Google Vertex AI provider — OAuth2 token minting for the Gemini
     # OpenAI-compatible endpoint. Only loaded when provider=vertex is selected;
     # google-auth is NOT in [all] so plain installs don't carry it.
     "provider.vertex": (
-        "google-auth==2.55.1",
+        "google-auth==2.56.3",
         "pyasn1==0.6.4",
     ),
     # Microsoft Foundry — Entra ID auth (managed identity, workload identity,
@@ -115,9 +115,9 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "provider.azure_identity": ("azure-identity==1.25.3",),
 
     # ─── Web search backends ───────────────────────────────────────────────
-    "search.exa": ("exa-py==2.10.2",),
-    "search.firecrawl": ("firecrawl-py==4.17.0",),
-    "search.parallel": ("parallel-web==0.4.2",),
+    "search.exa": ("exa-py==2.17.0",),
+    "search.firecrawl": ("firecrawl-py==4.34.0",),
+    "search.parallel": ("parallel-web==1.1.0",),
 
     # ─── Monitoring ─────────────────────────────────────────────────────────
     # OTLP gateway monitoring export. Lazily installed on first use of
@@ -137,16 +137,16 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # quarantined the project 2026-05-12 (malicious 2.4.6, Mini Shai-Hulud);
     # 2.4.6 was removed and clean releases resumed (2.4.7, 2.4.8). Voxtral
     # STT + TTS share the same SDK.
-    "tts.mistral": ("mistralai==2.4.8",),
-    "tts.edge": ("edge-tts==7.2.7",),
-    "tts.elevenlabs": ("elevenlabs==1.59.0",),
+    "tts.mistral": ("mistralai==2.9.1",),
+    "tts.edge": ("edge-tts==7.2.8",),
+    "tts.elevenlabs": ("elevenlabs==2.62.0",),
 
     # ─── Speech-to-text providers ──────────────────────────────────────────
-    "stt.mistral": ("mistralai==2.4.8",),
+    "stt.mistral": ("mistralai==2.9.1",),
     "stt.faster_whisper": (
         "faster-whisper==1.2.1",
         "sounddevice==0.5.5",
-        "numpy==2.4.3",
+        "numpy==2.4.6",
     ),
     # SILK voice-note decoding (WeChat/QQ .silk voice messages). pilk is a
     # small silk-v3 codec binding; installed on first .silk transcription.
@@ -167,9 +167,9 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     ),
     "wake.openwakeword": (
         "openwakeword==0.6.0",
-        "onnxruntime==1.27.0",
+        "onnxruntime==1.28.0",
         "sounddevice==0.5.5",
-        "numpy==2.4.3",
+        "numpy==2.4.6",
     ),
     # Open-vocabulary keyword spotting: any typed phrase, zero training.
     # sentencepiece is required by sherpa_onnx.text2token (runtime phrase
@@ -178,20 +178,20 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "sherpa-onnx==1.13.4",
         "sentencepiece==0.2.2",
         "sounddevice==0.5.5",
-        "numpy==2.4.3",
+        "numpy==2.4.6",
     ),
     "wake.porcupine": (
         "pvporcupine==4.0.3",
         "sounddevice==0.5.5",
-        "numpy==2.4.3",
+        "numpy==2.4.6",
     ),
 
     # ─── Image generation backends ─────────────────────────────────────────
-    "image.fal": ("fal-client==0.13.1",),
+    "image.fal": ("fal-client==1.0.0",),
 
     # ─── Memory providers ──────────────────────────────────────────────────
     "memory.honcho": ("honcho-ai==2.2.0",),
-    "memory.hindsight": ("hindsight-client==0.6.1",),
+    "memory.hindsight": ("hindsight-client==0.9.0",),
     # supermemory + mem0 are opt-in cloud memory providers with their own
     # SDKs. On the published Docker image the agent venv is sealed
     # (HERMES_DISABLE_LAZY_INSTALLS=1) and lazy installs are redirected to the
@@ -199,8 +199,8 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # ensure() to be installable there. Without an allowlist entry + an
     # ensure() call at the import site, the SDK never installs on a hosted
     # instance and the provider silently reports itself unavailable.
-    "memory.supermemory": ("supermemory==3.50.0",),
-    "memory.mem0": ("mem0ai==2.0.10",),
+    "memory.supermemory": ("supermemory==3.56.0",),
+    "memory.mem0": ("mem0ai==2.0.17",),
 
     # ─── Messaging platforms (lazy-installable on demand) ──────────────────
     "platform.telegram": ("python-telegram-bot[webhooks]==22.8",),
@@ -235,12 +235,12 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     ),
     "platform.dingtalk": (
         "dingtalk-stream==0.24.3",
-        "alibabacloud-dingtalk==2.2.42",
-        "qrcode==7.4.2",
+        "alibabacloud-dingtalk==2.2.54",
+        "qrcode==8.2",
     ),
     "platform.feishu": (
-        "lark-oapi==1.6.8",
-        "qrcode==7.4.2",
+        "lark-oapi==1.7.2",
+        "qrcode==8.2",
     ),
     # WeCom callback-mode adapter — parses untrusted XML POST bodies. Pulls
     # defusedxml only; aiohttp/httpx are core dependencies of every messaging
@@ -250,19 +250,19 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # (microsoft-teams-api/cards/common, dependency-injector, msal). Lazy-
     # installed on demand like every other messaging platform; also exposed
     # as the `teams` extra in pyproject for packagers / explicit installs.
-    "platform.teams": ("microsoft-teams-apps==2.0.13.4", "aiohttp==3.14.3"),  # aiohttp 3.14.3: prior CVEs + GHSA-cq5v-8q36-5273/GHSA-mfx4-hv73-q22v/GHSA-mq44-7p77-q5h7
+    "platform.teams": ("microsoft-teams-apps==2.0.15", "aiohttp==3.14.3"),  # aiohttp 3.14.3: prior CVEs + GHSA-cq5v-8q36-5273/GHSA-mfx4-hv73-q22v/GHSA-mq44-7p77-q5h7
 
     # ─── Terminal backends ─────────────────────────────────────────────────
-    "terminal.modal": ("modal==1.3.4",),
-    "terminal.daytona": ("daytona==0.155.0",),
-    "terminal.vercel": ("vercel==0.7.2",),
+    "terminal.modal": ("modal==1.5.3",),
+    "terminal.daytona": ("daytona==0.203.0",),
+    "terminal.vercel": ("vercel==0.9.0",),
 
     # ─── Skills ────────────────────────────────────────────────────────────
     "skill.google_workspace": (
-        "google-api-python-client==2.194.0",
-        "google-auth==2.55.1",
-        "google-auth-oauthlib==1.3.1",
-        "google-auth-httplib2==0.3.1",
+        "google-api-python-client==2.198.0",
+        "google-auth==2.56.3",
+        "google-auth-oauthlib==1.4.0",
+        "google-auth-httplib2==0.4.1",
         # Transitive via google-api-python-client/google-auth-httplib2; keep explicit
         # so lazy installs do not resolve vulnerable transitives: httplib2 0.31.2
         # (GHSA-j5g9-f88f-gfj3 decompression bomb DoS), stale pyasn1/google-auth.
@@ -276,9 +276,9 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "tool.acp": ("agent-client-protocol==0.9.0",),
     # Dashboard (`hermes dashboard`)
     "tool.dashboard": (
-        "fastapi==0.133.1",
-        "uvicorn[standard]==0.41.0",
-        "starlette==1.3.1",  # CVE-2026-48710 (BadHost) — keep lazy-install in sync with pyproject [web]
+        "fastapi==0.141.1",
+        "uvicorn[standard]==0.52.1",
+        "starlette==1.6.0",  # CVE-2026-48710 (BadHost) — keep lazy-install in sync with pyproject [web]
         "python-multipart==0.0.32",  # FastAPI UploadFile/Form for streaming uploads (NS-501)
     ),
     # Vision image-resize recovery (Pillow). Pillow is now a CORE dependency
@@ -303,8 +303,8 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # installs so computer_use never dead-ends on `No module named 'mcp'`.
     "tool.computer_use": (
         "mcp==2.0.0",
-        "httpx2==2.7.0",  # mcp 2.x HTTP stack — keep in sync with pyproject [computer-use]
-        "starlette==1.3.1",  # CVE-2026-48710 — keep in sync with pyproject [computer-use]
+        "httpx2==2.9.1",  # mcp 2.x HTTP stack — keep in sync with pyproject [computer-use]
+        "starlette==1.6.0",  # CVE-2026-48710 — keep in sync with pyproject [computer-use]
     ),
     # HF Agent Trace Viewer upload (hermes trace upload / /upload-trace).
     #
@@ -320,7 +320,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # uv.lock so the whole tree converges on ONE hub version
     # (tests/test_project_metadata.py enforces both). When bumping: update
     # here AND `uv lock --upgrade-package huggingface-hub` in lockstep.
-    "tool.trace_upload": ("huggingface-hub==1.24.0",),
+    "tool.trace_upload": ("huggingface-hub==1.28.0",),
 }
 
 
