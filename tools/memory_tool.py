@@ -42,6 +42,7 @@ Design:
 import copy
 import json
 import logging
+import os
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -426,6 +427,16 @@ class MemoryStore:
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
         self.user_entries = list(dict.fromkeys(self.user_entries))
 
+        # Upstream (#10877): external writers (MCP bridges, hand edits) can exceed the cap; the
+        # limit only fires on add/replace, so the oversized block would silently ride in the
+        # prompt while every later add is refused with no visible cause. Warn; never truncate.
+        for target in ("memory", "user"):
+            count, limit = self._char_count(target), self._char_limit(target)
+            if count > limit:
+                logger.warning("%s exceeds its char limit on load: %d/%d chars. Entries stay loaded; "
+                               "further additions are blocked until it is back under the limit.",
+                               self._path_for(target).name, count, limit)
+
         # Sanitize entries for the system-prompt snapshot only.  Live state
         # (memory_entries / user_entries) keeps the raw text so the user
         # can see + remove poisoned entries via the memory tool.
@@ -493,7 +504,20 @@ class MemoryStore:
             yield
             return
 
-        fd = open(lock_path, "a+", encoding="utf-8")
+        # Upstream (secure built-in memory lock files): owner-only, never follow a symlink, and
+        # tighten a lock left loose by an older Hermes process. Operating on the fd avoids a
+        # path-swap window.
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        raw_fd = os.open(lock_path, flags, 0o600)
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(raw_fd, 0o600)
+            fd = os.fdopen(raw_fd, "r+", encoding="utf-8")
+        except Exception:
+            os.close(raw_fd)
+            raise
         try:
             if fcntl:
                 fcntl.flock(fd, fcntl.LOCK_EX)
@@ -1080,6 +1104,17 @@ class MemoryStore:
                     )
 
             # Budget check against the FINAL state only.
+            if self._entries_for(target) and not working:
+                # Upstream #103419: a consolidation batch that removes the last entry would commit
+                # an empty file as a normal successful write. Refuse; single remove() is the
+                # deliberate-wipe path.
+                label = self._path_for(target).name
+                return self._batch_error(target, (
+                    f"Refusing to empty {label}: this batch would remove every entry from a "
+                    f"previously non-empty store. Nothing was applied (batch is all-or-nothing). "
+                    f"Keep at least one entry — merge overlapping entries into a shorter one instead "
+                    f"of removing the last one (see current_entries below). To delete the final entry "
+                    f"deliberately, use single remove() calls."))
             new_total = len(ENTRY_DELIMITER.join(working)) if working else 0
             if new_total > limit:
                 current = self._char_count(target)
@@ -1687,6 +1722,56 @@ def _missing_old_text_error(store: "MemoryStore", target: str, action: str) -> s
     )
 
 
+_BG_DELETE_ACTIONS = ("replace", "remove")
+
+
+def _batch_op_line(op: Dict[str, Any]) -> str:
+    op = op or {}
+    act, content, old = op.get("action", "?"), op.get("content") or op.get("new_text") or "", op.get("old_text", "")
+    if act == "remove":
+        return f"- remove: {old}"
+    return f"- replace: {old} -> {content}" if act == "replace" else f"- {act}: {content}"
+
+
+def _background_delete_gate(action, operations, target="memory", content=None, old_text=None) -> Optional[str]:
+    """Upstream (#105921): fail-closed operation gate for unattended background-review forks —
+    ``add`` stays available, while ``replace``/``remove`` (single or inside a batch) are never
+    applied unattended. The op is staged in the pending store instead of merely denied (the
+    fork's own review summary is never published back, so a plain denial would drop the
+    consolidation request with no surfacing path). A staging failure fails closed to a denial."""
+    from tools.skill_provenance import is_unattended_review
+
+    if not is_unattended_review():
+        return None
+    hit = action in _BG_DELETE_ACTIONS or any(
+        isinstance(op, dict) and op.get("action") in _BG_DELETE_ACTIONS for op in (operations or []))
+    if not hit:
+        return None
+    payload = ({"action": "batch", "target": target, "operations": operations}
+               if operations is not None else
+               {"action": action, "target": target, "content": content, "old_text": old_text})
+    detail = ("; ".join(_batch_op_line(op) for op in operations) if operations is not None
+              else _batch_op_line({"action": action, "content": content, "old_text": old_text}))
+    try:
+        from tools import write_approval as wa
+        record = wa.stage_write(
+            wa.MEMORY, payload,
+            summary=(f"background review consolidation ({'batch' if operations is not None else action} "
+                     f"on {target}): {detail}")[:200],
+            origin=wa.current_origin())
+        return json.dumps({
+            "success": True, "staged": True, "proposal_staged": True, "pending_id": record["id"],
+            "message": ("Background review may not delete memory entries unattended. The proposed "
+                        f"{'batch' if operations is not None else action} was staged for your approval — "
+                        "review it with /memory pending (approve to apply, discard to drop)."),
+        }, ensure_ascii=False)
+    except Exception:
+        logger.warning("Failed to stage background-review consolidation; denying", exc_info=True)
+        return tool_error(
+            "Background review may not delete memory entries ('replace'/'remove', including in a "
+            "batch); 'add' is still available.", success=False)
+
+
 def memory_tool(
     action: str = None,
     target: str = "memory",
@@ -1734,6 +1819,9 @@ def memory_tool(
     if operations:
         if not isinstance(operations, list):
             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
+        denied = _background_delete_gate(action, operations, target)
+        if denied is not None:
+            return denied
         gate_result = _apply_batch_write_gate(target, operations)
         if gate_result is not None:
             return gate_result
@@ -1757,6 +1845,9 @@ def memory_tool(
     if action == "remove" and not old_text:
         return _missing_old_text_error(store, target, "remove")
 
+    denied = _background_delete_gate(action, None, target, content, old_text)
+    if denied is not None:
+        return denied
     # Approval gate: when on, stages the write (background/gateway) or prompts
     # inline (interactive CLI); when off (default) passes straight through.
     gate_result = _apply_write_gate(action, target, content, old_text)
@@ -1994,5 +2085,19 @@ registry.register(
 )
 
 
+# ---- PLUGIN-COMPAT (upstream, temporary): old import paths external plugins used ----
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+_PLUGIN_COMPAT_LAZY = {
+    'atomic_write_text': ('utils', 'atomic_write_text'),
+}
 
 
+def __getattr__(name):  # PEP 562 — lazy so no import cycles
+    target = _PLUGIN_COMPAT_LAZY.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+    from hermes_cli.plugin_compat import warn_once
+    warn_once(__name__, name, *target)
+    return getattr(importlib.import_module(target[0]), target[1])
+# ---- END PLUGIN-COMPAT ----

@@ -15,7 +15,8 @@ import yaml
 
 import gateway.run as gateway_run
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent, SendResult
+from gateway.platforms.base import SendResult
+from gateway.platforms.event import MessageEvent
 from gateway.session import SessionSource
 
 
@@ -128,8 +129,8 @@ class TestFastChoicePicker:
 
         assert result is None
         values = [c["value"] for c in adapter.calls[0]["choices"]]
-        assert values == ["fast", "normal"]
-        # /fast keeps the compact two-up layout (two short choices).
+        assert values == ["fast", "normal", "auto", "cold"]
+        # /fast keeps the compact two-up layout (short choices).
         assert adapter.calls[0]["full_width"] is False
 
     @pytest.mark.asyncio
