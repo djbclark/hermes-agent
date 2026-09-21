@@ -94,6 +94,44 @@ def test_mark_broken_handles_no_workspace_silently(tmp_path):
         svc.shutdown()
 
 
+def test_snapshot_failure_retries_once_on_next_edit(tmp_path, monkeypatch):
+    """A spawn/initialize failure stays broken for the rest of that edit, then
+    the next snapshot (next write_file) retries once.  A second failure stays
+    broken so we do not retry-storm."""
+    repo = _make_git_workspace(tmp_path)
+    monkeypatch.chdir(str(repo))
+    src = repo / "x.py"
+    src.write_text("")
+
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=2.0,
+        install_strategy="manual",
+        disabled_servers=["ruff"],
+    )
+    try:
+        calls = {"n": 0}
+
+        async def boom(_path):
+            calls["n"] += 1
+            raise RuntimeError("initialize failed")
+
+        with patch.object(svc, "_snapshot_async", boom):
+            svc.snapshot_baseline(str(src))
+            assert ("pyright", str(repo)) in svc._broken
+            assert svc.enabled_for(str(src)) is False
+
+            svc.snapshot_baseline(str(src))
+            assert calls["n"] == 2
+            assert svc.enabled_for(str(src)) is False
+
+            svc.snapshot_baseline(str(src))
+            assert calls["n"] == 2
+    finally:
+        svc.shutdown()
+
+
 def test_snapshot_failure_marks_broken_via_outer_timeout(tmp_path, monkeypatch):
     """End-to-end: ``snapshot_baseline``'s outer ``_loop.run`` timeout
     triggers ``_mark_broken_for_file``, so a second call to
@@ -108,6 +146,7 @@ def test_snapshot_failure_marks_broken_via_outer_timeout(tmp_path, monkeypatch):
         wait_mode="document",
         wait_timeout=2.0,
         install_strategy="manual",
+        disabled_servers=["ruff"],
     )
     try:
         # Force the inner snapshot coroutine to raise.

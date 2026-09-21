@@ -47,6 +47,7 @@ def mock_pyright(monkeypatch, tmp_path):
     """Install the mock as ``pyright``; yield (spawn_count, folders_log, set_multi_root)."""
     idx = next(i for i, s in enumerate(SERVERS) if s.server_id == "pyright")
     original = SERVERS[idx]
+    saved = SERVERS[:]
     spawns = {"value": 0}
     folders_log = tmp_path / "folders.jsonl"
 
@@ -60,7 +61,7 @@ def mock_pyright(monkeypatch, tmp_path):
         )
 
     def _install(multi_root: bool) -> None:
-        SERVERS[idx] = ServerDef(
+        replacement = ServerDef(
             server_id="pyright",
             extensions=original.extensions,
             resolve_root=lambda fp, ws: ws,
@@ -68,9 +69,16 @@ def mock_pyright(monkeypatch, tmp_path):
             multi_root=multi_root,
             description="mock pyright",
         )
+        SERVERS[:] = saved
+        SERVERS[idx] = replacement
+        overlap = set(original.extensions)
+        SERVERS[:] = [
+            s for s in SERVERS
+            if s is replacement or not (set(s.extensions) & overlap)
+        ]
 
     yield spawns, folders_log, _install
-    SERVERS[idx] = original
+    SERVERS[:] = saved
 
 
 def _service() -> LSPService:

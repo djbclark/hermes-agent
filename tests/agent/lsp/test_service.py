@@ -32,10 +32,13 @@ def _install_mock_server(
     """Replace one registered server with a wrapper that spawns the mock.
 
     We reuse ``pyright`` so .py files route to it.  This keeps the
-    test free of any LSP toolchain dependency.
+    test free of any LSP toolchain dependency.  Sibling servers that
+    share the same extensions (ruff) are dropped for the duration so
+    the service does not also spawn a real brew binary.
     """
     target_index = next(i for i, s in enumerate(SERVERS) if s.server_id == server_id)
     original = SERVERS[target_index]
+    saved = SERVERS[:]
     scripts = [script] if isinstance(script, str) else script
     spawn_count = {"value": 0}
 
@@ -59,12 +62,16 @@ def _install_mock_server(
         seed_first_push=False,
         description="mock " + server_id,
     )
-    # Patch the SERVERS list element directly + restore on teardown.
     SERVERS[target_index] = replacement
+    overlap = set(original.extensions)
+    SERVERS[:] = [
+        s for s in SERVERS
+        if s is replacement or not (set(s.extensions) & overlap)
+    ]
 
     yield spawn_count
 
-    SERVERS[target_index] = original
+    SERVERS[:] = saved
 
 
 @pytest.fixture
@@ -272,6 +279,59 @@ def test_reaper_survives_sweep_error(mock_pyright):
         assert not svc._idle_reaper_task.done()
     finally:
         svc.shutdown()
+
+
+def test_matching_servers_merge_diagnostics(tmp_path, monkeypatch):
+    """A .py file must collect diagnostics from every matching server, not only pyright."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "pyproject.toml").write_text("")
+    src = repo / "x.py"
+    src.write_text("print('hi')\n")
+    monkeypatch.chdir(str(repo))
+
+    saved = SERVERS[:]
+
+    def _spawn_for(script: str):
+        def _spawn(root: str, ctx: ServerContext) -> SpawnSpec:
+            return SpawnSpec(
+                command=[sys.executable, MOCK_SERVER],
+                workspace_root=root,
+                cwd=root,
+                env={"MOCK_LSP_SCRIPT": script},
+            )
+        return _spawn
+
+    pyright = next(s for s in SERVERS if s.server_id == "pyright")
+    ruff = ServerDef(
+        server_id="ruff",
+        extensions=(".py", ".pyi"),
+        resolve_root=lambda fp, ws: ws,
+        build_spawn=_spawn_for("errors"),
+        description="mock ruff",
+    )
+    saved = SERVERS[:]
+    svc = None
+    try:
+        SERVERS[:] = [
+            ServerDef(
+                server_id="pyright",
+                extensions=pyright.extensions,
+                resolve_root=lambda fp, ws: ws,
+                build_spawn=_spawn_for("errors"),
+                description="mock pyright",
+            ),
+            ruff,
+        ]
+        svc = LSPService(enabled=True, wait_mode="document", wait_timeout=3.0, install_strategy="manual")
+        diags = svc.get_diagnostics_sync(str(src), delta=False)
+        assert len(diags) == 2
+        assert {c.server_id for c in svc._clients.values()} == {"pyright", "ruff"}
+    finally:
+        if svc is not None:
+            svc.shutdown()
+        SERVERS[:] = saved
 
 
 

@@ -86,12 +86,14 @@ def _install_mock_server(script: str, server_id: str = "pyright"):
     """Replace one registered server with a wrapper spawning the mock.
 
     Mirrors the helper in test_service.py — reuse pyright so .py files
-    route to the mock without a real toolchain.
+    route to the mock without a real toolchain.  Sibling servers that
+    share extensions (ruff) are dropped for the duration.
     """
     from agent.lsp.servers import SERVERS, ServerContext, ServerDef, SpawnSpec
 
     target_index = next(i for i, s in enumerate(SERVERS) if s.server_id == server_id)
     original = SERVERS[target_index]
+    saved = SERVERS[:]
 
     def _spawn(root: str, ctx: ServerContext) -> SpawnSpec:
         return SpawnSpec(
@@ -102,7 +104,7 @@ def _install_mock_server(script: str, server_id: str = "pyright"):
             initialization_options={},
         )
 
-    SERVERS[target_index] = ServerDef(
+    replacement = ServerDef(
         server_id=server_id,
         extensions=original.extensions,
         resolve_root=lambda fp, ws: ws,
@@ -110,7 +112,13 @@ def _install_mock_server(script: str, server_id: str = "pyright"):
         seed_first_push=False,
         description="mock " + server_id,
     )
-    return target_index, original
+    SERVERS[target_index] = replacement
+    overlap = set(original.extensions)
+    SERVERS[:] = [
+        s for s in SERVERS
+        if s is replacement or not (set(s.extensions) & overlap)
+    ]
+    return saved
 
 
 @pytest.fixture
@@ -120,11 +128,11 @@ def stale_repo(monkeypatch, tmp_path):
     (repo / ".git").mkdir()
     (repo / "pyproject.toml").write_text("")
     monkeypatch.chdir(str(repo))
-    idx, original = _install_mock_server("stale")
+    saved = _install_mock_server("stale")
     yield repo
     from agent.lsp.servers import SERVERS
 
-    SERVERS[idx] = original
+    SERVERS[:] = saved
 
 
 def test_service_reports_no_data_not_stale_errors(stale_repo):

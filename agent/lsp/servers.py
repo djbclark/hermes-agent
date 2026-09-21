@@ -44,6 +44,8 @@ _EXTS_BY_LANGUAGE: Dict[str, Sequence[str]] = {
     "julia": (".jl",), "elixir": (".ex", ".exs"), "zig": (".zig", ".zon"),
     "dockerfile": (".dockerfile",),
     "powershell": (".ps1", ".psm1", ".psd1"),
+    "markdown": (".md", ".markdown"),
+    "toml": (".toml",),
 }
 LANGUAGE_BY_EXT: Dict[str, str] = {ext: lang for lang, exts in _EXTS_BY_LANGUAGE.items() for ext in exts}
 
@@ -75,6 +77,12 @@ class ServerDef:
     # Server handles ``workspace/didChangeWorkspaceFolders``: one process serves every project root
     # (git worktrees included) as extra workspaceFolders instead of one process per root.
     multi_root: bool = False
+    # Extra wait budget (seconds) on top of the service default.  Used as
+    # ``max(service wait_timeout, this)`` so a slow first index (rust-analyzer)
+    # can publish without raising the global default for every language.
+    wait_timeout: Optional[float] = None
+    # PATH names ``hermes lsp which/status`` probe after a config command override.
+    binaries: Tuple[str, ...] = ()
 
     def matches(self, file_path: str) -> bool:
         return _file_ext_or_basename(file_path) in self.extensions
@@ -131,9 +139,24 @@ def _find_binary(ctx: ServerContext, server_id: str, which: Sequence[str], insta
     return bin_path
 
 
+def _merge_init(base: Optional[Dict[str, Any]], override: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Deep-merge ``override`` onto ``base``; nested dicts combine, other values from ``override`` win."""
+    if not base:
+        return dict(override or {})
+    if not override:
+        return dict(base)
+    out: Dict[str, Any] = dict(base)
+    for key, value in override.items():
+        if isinstance(out.get(key), dict) and isinstance(value, dict):
+            out[key] = _merge_init(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
 def _make_spec(root: str, ctx: ServerContext, server_id: str, command: List[str],
                base_init: Optional[Dict[str, Any]] = None, seed: bool = False) -> SpawnSpec:
-    init = ctx.init_overrides.get(server_id, {}) if base_init is None else {**base_init, **ctx.init_overrides.get(server_id, {})}
+    init = _merge_init(base_init, ctx.init_overrides.get(server_id) or {})
     return SpawnSpec(command, root, root, env=ctx.env_overrides.get(server_id, {}),
                      initialization_options=init, seed_diagnostics_on_first_push=seed)
 
@@ -150,15 +173,25 @@ def _simple_spawn(server_id: str, which: Sequence[str], args: Sequence[str] = ()
 
 # ---- bespoke spawn builders ----
 
+# Prefer basedpyright (brew) then classic pyright.  Server id stays ``pyright`` so
+# ``lsp.servers.pyright.command`` overrides keep working.
+_PYRIGHT_BINS = ("basedpyright-langserver", "basedpyright", "pyright-langserver", "pyright")
+_PYRIGHT_CLI_NAMES = {"pyright", "pyright.exe", "basedpyright", "basedpyright.exe"}
+_PYRIGHT_LANGSERVER_NAMES = ("basedpyright-langserver", "pyright-langserver")
+
+
 def _spawn_pyright(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
-    bin_path = _find_binary(ctx, "pyright", ("pyright-langserver", "pyright"), "pyright")
+    bin_path = _find_binary(ctx, "pyright", _PYRIGHT_BINS, "pyright")
     if bin_path is None:
         return None
-    # If we got the cli ``pyright``, the langserver is its sibling.
-    if os.path.basename(bin_path) in {"pyright", "pyright.exe"}:
-        sibling = os.path.join(os.path.dirname(bin_path), "pyright-langserver")
-        if os.path.exists(sibling):
-            bin_path = sibling
+    # CLI wrappers (``pyright`` / ``basedpyright``) ship the langserver as a sibling.
+    if os.path.basename(bin_path) in _PYRIGHT_CLI_NAMES:
+        directory = os.path.dirname(bin_path)
+        bin_path = next(
+            (os.path.join(directory, name) for name in _PYRIGHT_LANGSERVER_NAMES
+             if os.path.exists(os.path.join(directory, name))),
+            bin_path,
+        )
     # Point pyright at the project venv; its default "python on PATH" rarely is.
     py = _detect_python(root)
     return _make_spec(root, ctx, "pyright", [bin_path, "--stdio"], {"python": {"pythonPath": py}} if py else {})
@@ -247,6 +280,71 @@ def _spawn_powershell_es(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     )
 
 
+_TSSERVER_REL = os.path.join("typescript", "lib", "tsserver.js")
+
+
+def _is_classic_tsserver(path: str) -> bool:
+    """True iff ``path`` is a classic tsserver.js (TypeScript 7 dropped this file)."""
+    return os.path.isfile(path) and os.path.basename(path) == "tsserver.js"
+
+
+def _tsserver_js_near(start: str, *, hops: int = 8) -> Optional[str]:
+    """Walk parents of ``start`` looking for ``node_modules/typescript/lib/tsserver.js``."""
+    d = os.path.abspath(start)
+    for _ in range(hops):
+        for rel in (
+            os.path.join("node_modules", _TSSERVER_REL),
+            _TSSERVER_REL,
+            os.path.join("lib", "tsserver.js"),
+        ):
+            cand = os.path.join(d, rel)
+            if _is_classic_tsserver(cand):
+                return cand
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
+def _tls_has_classic_tsserver(tls_bin: str) -> bool:
+    """True when typescript-language-server can find a classic tsserver next to itself."""
+    return _tsserver_js_near(os.path.dirname(os.path.realpath(tls_bin)), hops=6) is not None
+
+
+def _discover_tsserver_js(tls_bin: str) -> Optional[str]:
+    """Locate a classic tsserver.js: Hermes lsp node_modules, TLS install tree, npm prefix."""
+    from hermes_constants import get_hermes_home
+    hermes_ts = os.path.join(str(get_hermes_home()), "lsp", "node_modules", _TSSERVER_REL)
+    if _is_classic_tsserver(hermes_ts):
+        return hermes_ts
+    near_tls = _tsserver_js_near(os.path.dirname(os.path.realpath(tls_bin)))
+    if near_tls:
+        return near_tls
+    npm = _which("npm")
+    if npm:
+        prefix = os.path.dirname(os.path.dirname(os.path.realpath(npm)))
+        cand = os.path.join(prefix, "lib", "node_modules", _TSSERVER_REL)
+        if _is_classic_tsserver(cand):
+            return cand
+    return None
+
+
+def _spawn_typescript(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+    """PATH typescript-language-server; inject tsserver.path when TS 7 would fail initialize."""
+    bin_path = _find_binary(
+        ctx, "typescript", ("typescript-language-server",), "typescript-language-server",
+    )
+    if bin_path is None:
+        return None
+    base_init: Dict[str, Any] = {}
+    if not _tls_has_classic_tsserver(bin_path):
+        tsserver = _discover_tsserver_js(bin_path)
+        if tsserver:
+            base_init = {"tsserver": {"path": tsserver}}
+    return _make_spec(root, ctx, "typescript", [bin_path, "--stdio"], base_init, seed=True)
+
+
 def hermes_lsp_session_dir() -> str:
     """Return (and create) the dir for PSES session/log scratch files."""
     from hermes_constants import get_hermes_home
@@ -267,23 +365,33 @@ def _server(server_id: str, extensions: Tuple[str, ...], description: str, *,
             resolve_root: Optional[_RootFn] = None, build_spawn: Optional[_SpawnFn] = None,
             which: Sequence[str] = (), args: Sequence[str] = (), install_pkg: Optional[str] = None,
             base_init: Optional[Dict[str, Any]] = None, seed: bool = False,
-            multi_root: bool = False) -> ServerDef:
+            multi_root: bool = False, wait_timeout: Optional[float] = None,
+            binaries: Sequence[str] = ()) -> ServerDef:
     """Registry entry factory: defaults to marker-based root + single-binary spawn."""
+    bins = tuple(binaries or which or (server_id,))
     return ServerDef(
         server_id, extensions,
         resolve_root or _markers_root(markers, excludes),
         build_spawn or _simple_spawn(server_id, which or (server_id,), args, install_pkg, base_init, seed),
         seed_first_push=seed, description=description, multi_root=multi_root,
+        wait_timeout=wait_timeout, binaries=bins,
     )
 
 
+_PY_MARKERS = ["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "Pipfile", "pyrightconfig.json"]
+# First cargo check on a cold rust-analyzer is often > the 5s document default.
+RUST_ANALYZER_WAIT_TIMEOUT = 20.0
+
 SERVERS: List[ServerDef] = [
-    _server("pyright", (".py", ".pyi"), "Python — Microsoft pyright",
-            markers=["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "Pipfile", "pyrightconfig.json"],
-            build_spawn=_spawn_pyright, multi_root=True),
+    _server("pyright", (".py", ".pyi"), "Python — basedpyright / pyright",
+            markers=_PY_MARKERS, build_spawn=_spawn_pyright, multi_root=True, binaries=_PYRIGHT_BINS),
+    # After pyright so find_server_for_file still returns pyright; the manager
+    # collects diagnostics from every match (ruff + pyright).
+    _server("ruff", (".py", ".pyi"), "Python linter — ruff server",
+            markers=_PY_MARKERS, which=("ruff",), args=("server",)),
     _server("typescript", (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"),
             "JavaScript/TypeScript — typescript-language-server", resolve_root=_root_typescript,
-            which=("typescript-language-server",), args=("--stdio",), install_pkg="typescript-language-server", seed=True),
+            which=("typescript-language-server",), build_spawn=_spawn_typescript, seed=True),
     _server("vue-language-server", (".vue",), "Vue.js — @vue/language-server", resolve_root=_root_typescript,
             args=("--stdio",), install_pkg="@vue/language-server"),
     _server("svelte-language-server", (".svelte",), "Svelte — svelte-language-server", resolve_root=_root_typescript,
@@ -291,7 +399,8 @@ SERVERS: List[ServerDef] = [
     _server("astro-language-server", (".astro",), "Astro — @astrojs/language-server", resolve_root=_root_typescript,
             which=("astro-ls", "astro-language-server"), args=("--stdio",), install_pkg="@astrojs/language-server"),
     _server("gopls", (".go",), "Go — gopls", markers=["go.work", "go.mod", "go.sum"], install_pkg="gopls"),
-    _server("rust-analyzer", (".rs",), "Rust — rust-analyzer", markers=["Cargo.toml", "Cargo.lock"], install_pkg="rust-analyzer"),
+    _server("rust-analyzer", (".rs",), "Rust — rust-analyzer", markers=["Cargo.toml", "Cargo.lock"],
+            install_pkg="rust-analyzer", seed=True, wait_timeout=RUST_ANALYZER_WAIT_TIMEOUT),
     _server("clangd", (".c", ".cpp", ".cc", ".cxx", ".h", ".hh", ".hpp", ".hxx"), "C/C++ — clangd",
             markers=["compile_commands.json", "compile_flags.txt", ".clangd"],
             args=("--background-index", "--clang-tidy"), install_pkg="clangd"),
@@ -333,13 +442,21 @@ SERVERS: List[ServerDef] = [
             markers=["pom.xml", "build.gradle", "build.gradle.kts", ".project", ".classpath", "settings.gradle"]),
     # No universal PowerShell root marker; nearest_root is exact-name only (no globs).
     _server("powershell", (".ps1", ".psm1", ".psd1"), "PowerShell — PowerShellEditorServices (manual bundle)",
-            markers=["PSScriptAnalyzerSettings.psd1"], build_spawn=_spawn_powershell_es),
+            markers=["PSScriptAnalyzerSettings.psd1"], build_spawn=_spawn_powershell_es, binaries=("pwsh", "powershell")),
+    _server("marksman", (".md", ".markdown"), "Markdown — marksman", which=("marksman",), args=("server",)),
+    _server("taplo", (".toml",), "TOML — taplo", which=("taplo",), args=("lsp", "stdio")),
 ]
 
 
+def find_servers_for_file(file_path: str) -> List[ServerDef]:
+    """Return every registry entry that handles ``file_path`` (possibly several, e.g. pyright + ruff)."""
+    return [srv for srv in SERVERS if srv.matches(file_path)]
+
+
 def find_server_for_file(file_path: str) -> Optional[ServerDef]:
-    """Return the registry entry that handles ``file_path``, or None."""
-    return next((srv for srv in SERVERS if srv.matches(file_path)), None)
+    """Return the first registry entry that handles ``file_path``, or None."""
+    matched = find_servers_for_file(file_path)
+    return matched[0] if matched else None
 
 
 def language_id_for(path: str) -> str:
@@ -347,4 +464,8 @@ def language_id_for(path: str) -> str:
     return LANGUAGE_BY_EXT.get(_file_ext_or_basename(path), "plaintext")
 
 
-__all__ = ["ServerDef", "ServerContext", "SpawnSpec", "SERVERS", "find_server_for_file", "language_id_for", "LANGUAGE_BY_EXT"]
+__all__ = [
+    "ServerDef", "ServerContext", "SpawnSpec", "SERVERS",
+    "find_server_for_file", "find_servers_for_file", "language_id_for", "LANGUAGE_BY_EXT",
+    "RUST_ANALYZER_WAIT_TIMEOUT",
+]

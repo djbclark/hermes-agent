@@ -57,6 +57,8 @@ def run_lsp_command(args: argparse.Namespace) -> int:
 
 
 def _status_for(server_id: str) -> str:
+    if _resolved_binary(server_id):
+        return "installed"
     from agent.lsp.install import detect_status
     return detect_status(_recipe_pkg_for(server_id))
 
@@ -158,8 +160,7 @@ def _cmd_restart() -> int:
 
 
 def _cmd_which(server_id: str) -> int:
-    from agent.lsp.install import INSTALL_RECIPES, _existing_binary
-    resolved = _existing_binary((INSTALL_RECIPES.get(server_id) or {}).get("bin", server_id))
+    resolved = _resolved_binary(server_id)
     if resolved:
         sys.stdout.write(resolved + "\n")
         return 0
@@ -179,6 +180,42 @@ _RECIPE_ALIASES = {
 def _recipe_pkg_for(server_id: str) -> str:
     """Map a registry ``server_id`` to its install-recipe package key."""
     return _RECIPE_ALIASES.get(server_id, server_id)
+
+
+def _binary_overrides_from_config() -> dict:
+    """``lsp.servers.<id>.command`` lists from config; empty dict if config can't load."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
+    except Exception:  # noqa: BLE001
+        return {}
+    servers = ((cfg or {}).get("lsp") or {}).get("servers") or {}
+    if not isinstance(servers, dict):
+        return {}
+    return {
+        n: c["command"] for n, c in servers.items()
+        if isinstance(c, dict) and isinstance(c.get("command"), list) and c["command"]
+    }
+
+
+def _resolved_binary(server_id: str) -> str | None:
+    """Config command[0] (if that path exists) → PATH probe → install-recipe / staging dir."""
+    import os
+    import shutil
+    from agent.lsp.install import INSTALL_RECIPES, _existing_binary
+    from agent.lsp.servers import SERVERS
+
+    override = _binary_overrides_from_config().get(server_id)
+    if override and override[0] and os.path.exists(override[0]):
+        return override[0]
+    srv = next((s for s in SERVERS if s.server_id == server_id), None)
+    names = tuple(srv.binaries) if srv and srv.binaries else (server_id,)
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return found
+    pkg = _recipe_pkg_for(server_id)
+    return _existing_binary((INSTALL_RECIPES.get(pkg) or {}).get("bin", server_id))
 
 
 def _backend_warnings() -> list:

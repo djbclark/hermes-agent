@@ -21,7 +21,7 @@ from agent.lsp.protocol import LSPProtocolError
 MOCK_SERVER = str(Path(__file__).parent / "_mock_lsp_server.py")
 
 
-def _client(workspace: Path, script: str = "clean") -> LSPClient:
+def _client(workspace: Path, script: str = "clean", *, seed: bool = False) -> LSPClient:
     env = {"MOCK_LSP_SCRIPT": script, "PYTHONPATH": os.environ.get("PYTHONPATH", "")}
     return LSPClient(
         server_id=f"mock-{script}",
@@ -29,6 +29,7 @@ def _client(workspace: Path, script: str = "clean") -> LSPClient:
         command=[sys.executable, MOCK_SERVER],
         env=env,
         cwd=str(workspace),
+        seed_diagnostics_on_first_push=seed,
     )
 
 
@@ -69,6 +70,28 @@ async def test_client_receives_published_errors(tmp_path: Path):
         assert d["code"] == "MOCK001"
         assert d["source"] == "mock-lsp"
         assert "synthetic error" in d["message"]
+    finally:
+        await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_seed_first_push_ignores_empty_pull_until_later_push(tmp_path: Path):
+    """rust-analyzer (and tsserver) publish an empty pull before cargo/typecheck.
+
+    That must not count as a clean verdict when the first push is seeded.
+    """
+    f = tmp_path / "x.rs"
+    f.write_text("fn main() {}\n")
+    client = _client(tmp_path, "errors", seed=True)
+    await client.start()
+    try:
+        v0 = await client.open_file(str(f), language_id="rust")
+        # didOpen push is the seed; mock pull is empty.  Must wait, not return clean.
+        assert await client.wait_for_diagnostics(str(f), v0, timeout=0.4) is False
+        f.write_text("fn main() { nope }\n")
+        v1 = await client.open_file(str(f), language_id="rust")
+        assert await client.wait_for_diagnostics(str(f), v1, timeout=2.0) is True
+        assert client.diagnostics_for(str(f), fresh_only=True)
     finally:
         await client.shutdown()
 

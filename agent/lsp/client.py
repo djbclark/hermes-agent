@@ -570,18 +570,20 @@ class LSPClient:
             remaining = deadline - now()
             if remaining <= 0:
                 return False
-            # Concurrent: document pull + push wait.
-            tasks = {
-                asyncio.create_task(self._pull_document_diagnostics(abs_path)),
-                asyncio.create_task(self._wait_for_fresh_push(abs_path, version, remaining)),
-            }
+            doc = self._docs.get(abs_path)
+            # seed_first_push: an empty/early pull (rust-analyzer before cargo
+            # flycheck, tsserver before typecheck) is not a verdict.  Wait for a
+            # publishDiagnostics that arrived after the seed push.
+            if doc and doc.fresh(version) and not (self._seed_first_push and not doc.fresh_push(version)):
+                return True
+            tasks = {asyncio.create_task(self._wait_for_fresh_push(abs_path, version, remaining))}
+            already_pulled = self._seed_first_push and doc is not None and doc.fresh_pull(version)
+            if not already_pulled:
+                tasks.add(asyncio.create_task(self._pull_document_diagnostics(abs_path)))
             _done, pending = await asyncio.wait(tasks, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
             for t in pending:
                 t.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
-            doc = self._docs.get(abs_path)
-            if doc and doc.fresh(version):
-                return True
 
     async def _await_push(self, timeout: float) -> bool:
         """Block until the next publishDiagnostics or ``timeout``; True iff a push woke us."""

@@ -5,9 +5,11 @@
 spawned client per ``(server_id, workspace_root)`` — servers flagged ``multi_root`` (pyright) get ONE
 client per ``server_id`` and further roots (typically sibling git worktrees) are attached to the running
 process via ``workspace/didChangeWorkspaceFolders`` — a **broken-set** of pairs that failed
-to spawn/initialize (never retried for the life of the service), and a **delta baseline**
+to spawn/initialize (retried once on the next edit, then skipped until ``hermes lsp restart`` / exit),
+and a **delta baseline**
 per file (``snapshot_baseline()`` runs BEFORE a write; the next ``get_diagnostics_sync()``
 returns only diagnostics not in it).  Off unless config enables it.
+Every matching server for a file (e.g. pyright + ruff) is spawned and its diagnostics merged.
 """
 from __future__ import annotations
 
@@ -20,13 +22,15 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agent.lsp import eventlog
 from agent.lsp.client import DIAGNOSTICS_DOCUMENT_WAIT, LSPClient, _diagnostic_key as _diag_key
-from agent.lsp.servers import ServerContext, ServerDef, find_server_for_file, language_id_for
+from agent.lsp.servers import ServerContext, ServerDef, find_servers_for_file, language_id_for
 from agent.lsp.workspace import clear_cache, resolve_workspace_for_file
 
 logger = logging.getLogger("agent.lsp.manager")
 
 DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
 MIN_IDLE_TIMEOUT = 30  # floor for config values; must exceed any per-op wait budget
+# Outer ``_loop.run`` budget beyond the per-server wait, so initialize isn't cancelled by the wait cap.
+SPAWN_HEADROOM = 10.0
 
 _Key = Tuple[str, str]
 _Diags = List[Dict[str, Any]]
@@ -121,6 +125,10 @@ class LSPService:
         # Per-(server_id, workspace_root) state
         self._clients: Dict[_Key, LSPClient] = {}
         self._broken: set = set()
+        # One retry after spawn/initialize failure, consumed at the start of the next edit
+        # (snapshot_baseline).  Keys in ``_broken_retried`` already used that retry.
+        self._broken_retry_allowed: set = set()
+        self._broken_retried: set = set()
         self._spawning: Dict[_Key, asyncio.Future] = {}
         self._last_used: Dict[_Key, float] = {}
         self._state_lock = threading.Lock()
@@ -187,23 +195,55 @@ class LSPService:
         except Exception:  # noqa: BLE001
             return (srv.server_id, ws_root)
 
+    def _matching_servers(self, file_path: str, *, include_broken: bool = False) -> List[ServerDef]:
+        """Registered, not-disabled servers for ``file_path`` (optionally including broken pairs)."""
+        if not self._enabled:
+            return []
+        out: List[ServerDef] = []
+        for srv in find_servers_for_file(file_path):
+            if srv.server_id in self._disabled_servers:
+                continue
+            key = self._broken_key(srv, file_path)
+            if key is None:
+                continue
+            if not include_broken and key in self._broken:
+                continue
+            out.append(srv)
+        return out
+
+    def _server_wait(self, srv: ServerDef) -> float:
+        """Per-op wait: service default, raised to the server's own floor when it has one."""
+        extra = srv.wait_timeout if srv.wait_timeout is not None else 0.0
+        return max(self._wait_timeout, extra)
+
+    def _wait_budget(self, file_path: str) -> float:
+        """Slowest matching-server wait (including broken ones about to be retried)."""
+        servers = self._matching_servers(file_path, include_broken=True)
+        return max((self._server_wait(s) for s in servers), default=self._wait_timeout)
+
+    def _allow_retry_for_file(self, file_path: str) -> None:
+        """At the start of an edit, consume one spawn/initialize retry for each broken pair."""
+        for srv in self._matching_servers(file_path, include_broken=True):
+            key = self._broken_key(srv, file_path)
+            if key is None or key not in self._broken or key not in self._broken_retry_allowed:
+                continue
+            self._broken.discard(key)
+            self._broken_retry_allowed.discard(key)
+            self._broken_retried.add(key)
+
     def enabled_for(self, file_path: str) -> bool:
-        """True iff LSP should run for this file: registered non-disabled server, git workspace,
-        and pair not broken (a failed server costs nothing until ``hermes lsp restart`` / exit)."""
-        srv = find_server_for_file(file_path) if self._enabled else None
-        if srv is None or srv.server_id in self._disabled_servers:
-            return False
-        key = self._broken_key(srv, file_path)
-        return key is not None and key not in self._broken
+        """True iff at least one matching server is usable (git workspace, not disabled, not broken)."""
+        return bool(self._matching_servers(file_path))
 
     def snapshot_baseline(self, file_path: str) -> None:
         """Snapshot current diagnostics for ``file_path`` as the delta baseline (call BEFORE a write).
         Best-effort: failures are swallowed so a flaky server can't break a write, but they mark the pair broken."""
+        self._allow_retry_for_file(file_path)
         if not self.enabled_for(file_path):
             return
         try:
             # Outer budget must exceed the inner wait or a slow-but-alive server gets falsely marked broken.
-            t = max(8.0, self._wait_timeout + 3.0)
+            t = max(8.0, self._wait_budget(file_path) + SPAWN_HEADROOM)
             diags = self._loop.run(self._snapshot_async(file_path), timeout=t)
         except Exception as e:  # noqa: BLE001
             logger.debug("baseline snapshot failed for %s: %s", file_path, e)
@@ -221,12 +261,14 @@ class LSPService:
         :func:`agent.lsp.range_shift.build_line_shift`) remaps that baseline into post-edit coordinates
         first, so pre-existing diagnostics that merely moved don't look introduced by this edit.
         ``[]`` when LSP is disabled, nothing matches, or the server can't be spawned.
+        Collects from every matching server (e.g. pyright + ruff) and merges.
         """
         if not self.enabled_for(file_path):
             return []
-        server_id = find_server_for_file(file_path).server_id  # enabled_for guarantees a match
+        servers = self._matching_servers(file_path)
+        server_id = servers[0].server_id if servers else "lsp"
         try:
-            t = timeout if timeout is not None else self._wait_timeout + 2.0
+            t = timeout if timeout is not None else self._wait_budget(file_path) + SPAWN_HEADROOM
             diags = self._loop.run(self._open_and_wait_async(file_path), timeout=t)
         except Exception as e:  # noqa: BLE001
             if isinstance(e, asyncio.TimeoutError):
@@ -271,17 +313,15 @@ class LSPService:
             self._delta_baseline[abs_path] = fresh
         return diags
 
-    def _mark_broken_for_file(self, file_path: str, exc: BaseException) -> None:
-        """Mark the file's ``(server_id, root)`` pair broken after an outer timeout/error.
-        The outer ``_loop.run`` timeout cancels the in-flight spawn before ``_get_or_spawn`` could record
-        the failure; without this every later write would re-pay the full timeout.  Also kills any
-        half-initialized client and logs the failure once."""
-        srv = find_server_for_file(file_path)
-        key = self._broken_key(srv, file_path) if srv is not None else None
+    def _mark_broken(self, srv: ServerDef, file_path: str, exc: BaseException) -> None:
+        """Mark one ``(server_id, root)`` pair broken after spawn/initialize/outer-timeout failure."""
+        key = self._broken_key(srv, file_path)
         if key is None:
             return
         already_broken = key in self._broken
         self._broken.add(key)
+        if key not in self._broken_retried:
+            self._broken_retry_allowed.add(key)
         ckey = _client_key(srv, key[1])
         with self._state_lock:
             client = self._clients.pop(ckey, None)
@@ -294,6 +334,24 @@ class LSPService:
                 pass
         if not already_broken:
             eventlog.log_spawn_failed(key[0], key[1], exc)
+
+    def _mark_broken_for_file(self, file_path: str, exc: BaseException) -> None:
+        """Mark matching servers that don't have a healthy client after an outer timeout/error.
+
+        The outer ``_loop.run`` timeout cancels the in-flight spawn before ``_get_or_spawn`` could record
+        the failure; without this every later write would re-pay the full timeout.  Alive clients
+        from sibling servers (ruff vs pyright) are left running.
+        """
+        for srv in self._matching_servers(file_path, include_broken=True):
+            key = self._broken_key(srv, file_path)
+            if key is None:
+                continue
+            ckey = _client_key(srv, key[1])
+            with self._state_lock:
+                client = self._clients.get(ckey)
+            if client is not None and client.is_running:
+                continue
+            self._mark_broken(srv, file_path, exc)
 
     def shutdown(self) -> None:
         """Tear down all clients and stop the background loop."""
@@ -329,46 +387,72 @@ class LSPService:
         return await self._open_and_wait_async(file_path, snapshot=True) or []
 
     async def _open_and_wait_async(self, file_path: str, *, snapshot: bool = False) -> Optional[_Diags]:
-        """Open + wait for FRESH diagnostics: ``[]`` = checked clean, ``None`` = no verdict in budget.
+        """Open + wait on every matching server.  ``[]`` = all checked clean, ``None`` = no verdict.
 
         Callers must not substitute stale data for either.  ``snapshot`` mode
-        (pre-write baseline) skips didSave and uses the default wait budget.
+        (pre-write baseline) skips didSave and uses each server's default wait budget.
         """
-        client = await self._get_or_spawn(file_path)
+        servers = self._matching_servers(file_path)
+        if not servers:
+            return None
+        results = await asyncio.gather(
+            *(self._open_and_wait_one(srv, file_path, snapshot=snapshot) for srv in servers),
+            return_exceptions=True,
+        )
+        merged: _Diags = []
+        got_verdict = False
+        for srv, result in zip(servers, results):
+            if isinstance(result, Exception):
+                logger.debug("open/wait failed for %s (%s): %s", file_path, srv.server_id, result)
+                continue
+            if result is None:
+                continue
+            got_verdict = True
+            merged.extend(result)
+        return merged if got_verdict else None
+
+    async def _open_and_wait_one(
+        self, srv: ServerDef, file_path: str, *, snapshot: bool = False,
+    ) -> Optional[_Diags]:
+        client = await self._get_or_spawn(file_path, srv)
         if client is None:
             return None
         try:
             version = await client.open_file(file_path, language_id=language_id_for(file_path))
             if not snapshot:
                 await client.save_file(file_path)
+            wait = None if snapshot else self._server_wait(srv)
             fresh = await client.wait_for_diagnostics(
-                file_path, version, mode=self._wait_mode, timeout=None if snapshot else self._wait_timeout,
+                file_path, version, mode=self._wait_mode, timeout=wait,
             )
         except Exception as e:  # noqa: BLE001
             if snapshot:
-                logger.debug("snapshot open/wait failed: %s", e)
+                logger.debug("snapshot open/wait failed (%s): %s", srv.server_id, e)
             else:
-                logger.debug("open/wait failed for %s: %s", file_path, e)
+                logger.debug("open/wait failed for %s (%s): %s", file_path, srv.server_id, e)
             return None
         self._touch(client)
         return list(client.diagnostics_for(file_path, fresh_only=True)) if fresh else None
 
     async def _current_diags_async(self, file_path: str) -> _Diags:
         ws, gated = resolve_workspace_for_file(file_path)
-        srv = find_server_for_file(file_path)
-        if not (ws and gated and srv):
+        if not (ws and gated):
             return []
-        # Same key _get_or_spawn() stored under: single-root servers live under their
-        # resolved project root (a nested package.json), not the enclosing workspace.
-        root = srv.resolve_root(file_path, ws)
-        if root is None:
-            return []
-        with self._state_lock:
-            client = self._clients.get(_client_key(srv, root))
-        return list(client.diagnostics_for(file_path, fresh_only=True)) if client else []
+        merged: _Diags = []
+        for srv in self._matching_servers(file_path, include_broken=True):
+            root = srv.resolve_root(file_path, ws)
+            if root is None:
+                continue
+            with self._state_lock:
+                client = self._clients.get(_client_key(srv, root))
+            if client:
+                merged.extend(client.diagnostics_for(file_path, fresh_only=True))
+        return merged
 
-    async def _get_or_spawn(self, file_path: str) -> Optional[LSPClient]:
-        srv = find_server_for_file(file_path)
+    async def _get_or_spawn(self, file_path: str, srv: Optional[ServerDef] = None) -> Optional[LSPClient]:
+        if srv is None:
+            matched = self._matching_servers(file_path)
+            srv = matched[0] if matched else None
         if srv is None:
             return None
         if srv.server_id in self._disabled_servers:
@@ -403,9 +487,13 @@ class LSPService:
             return await self._attach_root(srv, client, root) if client is not None else None
         try:
             client = await self._spawn_client(srv, root)
+            broken_key = (srv.server_id, root)
             if client is None:
-                self._broken.add((srv.server_id, root))
+                self._broken.add(broken_key)
+                if broken_key not in self._broken_retried:
+                    self._broken_retry_allowed.add(broken_key)
             else:
+                self._broken_retried.discard(broken_key)
                 with self._state_lock:
                     self._clients[key] = client
                     self._last_used[key] = time.time()
@@ -488,6 +576,8 @@ class LSPService:
             clients = list(self._clients.values())
             self._clients.clear()
             self._broken.clear()
+            self._broken_retry_allowed.clear()
+            self._broken_retried.clear()
             self._last_used.clear()
         await asyncio.gather(*(c.shutdown() for c in clients), return_exceptions=True)
 
