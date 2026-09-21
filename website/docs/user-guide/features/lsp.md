@@ -1,13 +1,14 @@
 ---
 sidebar_position: 16
 title: "LSP — Semantic Diagnostics"
-description: "Real language servers (pyright, gopls, rust-analyzer, …) wired into the post-write lint check used by write_file and patch."
+description: "Real language servers (basedpyright, ruff, gopls, rust-analyzer, marksman, taplo, …) wired into the post-write lint check used by write_file and patch."
 ---
 
 # Language Server Protocol (LSP)
 
-Hermes runs full language servers — pyright, gopls, rust-analyzer,
-typescript-language-server, clangd, and ~20 more — as background
+Hermes runs full language servers — basedpyright (or pyright), ruff,
+gopls, rust-analyzer, typescript-language-server, marksman, taplo,
+clangd, and ~20 more — as background
 subprocesses and feeds their semantic diagnostics into the post-write
 lint check used by `write_file` and `patch`. When the agent edits a
 file, it sees exactly the errors that edit introduced — not just
@@ -60,7 +61,8 @@ agent sees a syntax-clean file with semantic problems as
 
 | Language | Server | Auto-install |
 |----------|--------|--------------|
-| Python | `pyright-langserver` | npm |
+| Python | `basedpyright-langserver` (preferred) or `pyright-langserver` | npm (pyright fallback) |
+| Python (lint) | `ruff server` | PATH / brew (`ruff`) |
 | TypeScript / JavaScript / JSX / TSX | `typescript-language-server` | npm |
 | Vue | `@vue/language-server` | npm |
 | Svelte | `svelte-language-server` | npm |
@@ -87,6 +89,12 @@ agent sees a syntax-clean file with semantic problems as
 | Kotlin | `kotlin-language-server` | manual |
 | Java | `jdtls` | manual |
 | PowerShell | `PowerShellEditorServices` (`pwsh` host) | manual (release zip) |
+| Markdown | `marksman` | PATH / brew (`marksman`) |
+| TOML | `taplo lsp stdio` | PATH / brew (`taplo`) |
+
+Python files run **both** basedpyright/pyright and ruff; the pyright
+config key (`lsp.servers.pyright`) is unchanged. Homebrew binaries on
+PATH are used as-is — no extra `command` override is required.
 
 For "manual" entries, install the server through whatever toolchain
 manager makes sense for that language (rustup, ghcup, opam, brew,
@@ -120,7 +128,15 @@ won't auto-pull. The current case is `typescript-language-server`,
 which requires the `typescript` SDK importable from the same
 `node_modules` tree — Hermes installs both packages together when you
 run `hermes lsp install typescript` or auto-install fires on first
-use.
+use. Homebrew `typescript` 7 dropped `tsserver.js`; when the brew
+`typescript-language-server` cannot find a classic SDK, Hermes injects
+`initializationOptions.tsserver.path` pointing at a TypeScript 5.x
+`tsserver.js` under `<HERMES_HOME>/lsp/node_modules` (install
+`typescript@5` there if it is missing). User `initialization_options`
+merge on top of that instead of replacing it.
+
+`hermes lsp which <id>` prints the config `command[0]` override when
+that path exists, not only the auto-install recipe binary.
 
 ## CLI
 
