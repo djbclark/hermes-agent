@@ -1401,6 +1401,12 @@ def _locate_launchd_gateway_service(label: str) -> tuple[str | None, int | None]
 # instead so launchd stays in charge. Guarded by tests/hermes_cli/test_gateway_service.py
 # (TestForeignLaunchdGateway*) and ~/.hermes/scripts/check-gateway-fork-invariants.sh.
 
+def _launchd_user_home() -> Path:
+    """Real account home for ``~/Library/LaunchAgents`` (profile mode may point HOME at a profile dir)."""
+    import pwd
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)  # windows-footgun: ok — macOS-only launchd helper
+
+
 def _parse_launchd_label_for_pid(output: str, pid: int) -> str | None:
     """Label whose legacy ``launchctl list`` row (``PID<TAB>Status<TAB>Label``; ``-`` for no live
     process) carries ``pid``."""
@@ -1486,9 +1492,8 @@ def _find_foreign_launchd_gateway_plist() -> tuple[str, Path] | None:
     if not is_macos():
         return None
     import plistlib
-    import pwd
 
-    agents_dir = Path(pwd.getpwuid(os.getuid()).pw_dir) / "Library" / "LaunchAgents"  # windows-footgun: ok — macOS only
+    agents_dir = _launchd_user_home() / "Library" / "LaunchAgents"
     if not agents_dir.is_dir():
         return None
     for plist_path in sorted(agents_dir.glob("*.plist")):

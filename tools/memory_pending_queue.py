@@ -222,6 +222,10 @@ def _connection():
     """
     path = queue_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Owner-only home for the journal (pending records carry user-authored memory content).
+    # Upstream used to leave HERMES_HOME at 0700 as a side effect of its state-DB preflight;
+    # since v2026.9.14 nothing else restricts it, so this module secures its own directory.
+    _restrict_permissions(path.parent, is_dir=True)
 
     from hermes_state import apply_wal_with_fallback, preflight_db_writability
 
