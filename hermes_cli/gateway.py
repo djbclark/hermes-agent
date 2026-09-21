@@ -8268,6 +8268,12 @@ def _gateway_command_inner(args):
                     service_stopped = True
                 except subprocess.CalledProcessError:
                     pass
+            elif is_macos() and (foreign := _find_foreign_launchd_gateway()) is not None:
+                try:
+                    _stop_foreign_launchd_gateway(*foreign)
+                    service_stopped = True
+                except subprocess.CalledProcessError:
+                    pass
             elif is_windows():
                 from hermes_cli import gateway_windows
 
@@ -8292,6 +8298,10 @@ def _gateway_command_inner(args):
                 systemd_start(system=system)
             elif is_macos() and get_launchd_plist_path().exists():
                 launchd_start()
+            elif is_macos() and (foreign_plist := _find_foreign_launchd_gateway_plist()) is not None:
+                # Operator-managed LaunchAgent (booted out above): reload it
+                # rather than running a foreground gateway against nothing.
+                _start_foreign_launchd_gateway(*foreign_plist)
             elif is_windows():
                 from hermes_cli import gateway_windows
 

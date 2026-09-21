@@ -1032,6 +1032,24 @@ class TestForeignLaunchdGatewayStopStart:
         assert calls == [("start", "com.example.gw")]
 
 
+    @pytest.mark.macos_only
+    def test_gateway_restart_all_reloads_foreign_job_instead_of_foreground(self, tmp_path, monkeypatch):
+        plist = tmp_path / "com.example.gw.plist"
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "ai.hermes.gateway.plist")
+        monkeypatch.setattr(gateway_cli, "_find_foreign_launchd_gateway", lambda: ("com.example.gw", "gui/501", 4242))
+        monkeypatch.setattr(gateway_cli, "_find_foreign_launchd_gateway_plist", lambda: ("com.example.gw", plist))
+        calls = []
+        monkeypatch.setattr(gateway_cli, "_stop_foreign_launchd_gateway", lambda label, domain, pid: calls.append(("stop", label)))
+        monkeypatch.setattr(gateway_cli, "kill_gateway_processes", lambda all_profiles=False, force=False: 0)
+        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda timeout=10.0, force_after=5.0: True)
+        monkeypatch.setattr(gateway_cli, "_start_foreign_launchd_gateway", lambda label, path: calls.append(("start", label)))
+        monkeypatch.setattr(gateway_cli, "run_gateway", lambda verbose=0, quiet=False, replace=False: calls.append("foreground"))
+
+        gateway_cli.gateway_command(SimpleNamespace(gateway_command="restart", system=False, all=True))
+
+        assert calls == [("stop", "com.example.gw"), ("start", "com.example.gw")]
+
+
 class TestDetectVenvDir:
     """Tests for _detect_venv_dir() virtualenv detection."""
 
