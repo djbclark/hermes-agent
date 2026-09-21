@@ -202,6 +202,15 @@ def _get_service_pids(all_profiles: bool = False) -> set:
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 pass
 
+    if is_macos():
+        # Operator-managed LaunchAgent (see _find_foreign_launchd_gateway):
+        # its gateway is service-managed too and must not be swept as manual.
+        try:
+            foreign = _find_foreign_launchd_gateway()
+        except Exception:
+            foreign = None
+        if foreign is not None:
+            pids.add(foreign[2])
     return pids
 
 
@@ -5265,6 +5274,17 @@ def refresh_launchd_plist_if_needed() -> bool:
 def launchd_install(force: bool = False):
     plist_path = get_launchd_plist_path()
 
+    foreign = None if plist_path.exists() else _find_foreign_launchd_gateway_plist()
+    if foreign is not None and not force:
+        print_error(
+            f"An operator-managed gateway LaunchAgent already exists: {foreign[0]}\n"
+            f"  ({foreign[1]})\n"
+            "  Installing ai.hermes.gateway beside it would run two KeepAlive gateways\n"
+            "  that --replace each other forever. `hermes gateway start|stop|restart|status`\n"
+            "  already drive that job. Pass --force to install anyway."
+        )
+        sys.exit(1)
+
     if plist_path.exists() and not force:
         if not launchd_plist_is_current():
             print(f"↻ Repairing outdated launchd service at: {plist_path}")
@@ -8474,7 +8494,7 @@ def _gateway_command_inner(args):
                         "To install as a Windows Scheduled Task (auto-start on login):"
                     )
                     print("  hermes gateway install")
-                else:
+                elif foreign is None:
                     print("To install as a service:")
                     print("  hermes gateway install")
                     print("  sudo hermes gateway install --system")

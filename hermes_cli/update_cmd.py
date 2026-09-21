@@ -4561,6 +4561,34 @@ def _restart_macos_launchd_gateways(
         pass
 
     # --- Sibling profiles ---------------------------------------------------
+    # Operator-managed LaunchAgent under a label of its own (no
+    # ai.hermes.gateway plist): restart it through launchd like the fleet,
+    # so the manual-process sweep below never SIGTERMs a KeepAlive job.
+    try:
+        from hermes_cli.gateway import (
+            _find_foreign_launchd_gateway,
+            _restart_foreign_launchd_gateway,
+        )
+
+        foreign = (
+            None if get_launchd_plist_path().exists() else _find_foreign_launchd_gateway()
+        )
+    except Exception:
+        foreign = None
+    if foreign is not None:
+        f_label, f_domain, f_pid = foreign
+        print(f"  → {f_label}: operator-managed launchd job (PID {f_pid})")
+        try:
+            _restart_foreign_launchd_gateway(f_label, f_domain, f_pid)
+            restarted_services.append(f_label)
+        except subprocess.CalledProcessError as e:
+            stderr = (getattr(e, "stderr", "") or "").strip()
+            print(f"  ⚠ {f_label} restart failed: {stderr}")
+            failed_or_stale_units.append(f_label)
+        except subprocess.TimeoutExpired:
+            print(f"  ⚠ launchctl timed out restarting {f_label}")
+            failed_or_stale_units.append(f_label)
+
     for label in launchd_gateway_labels_for_install():
         if label == current_label:
             continue

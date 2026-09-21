@@ -1050,6 +1050,40 @@ class TestForeignLaunchdGatewayStopStart:
         assert calls == [("stop", "com.example.gw"), ("start", "com.example.gw")]
 
 
+    def test_launchd_install_refuses_beside_foreign_job(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "ai.hermes.gateway.plist")
+        monkeypatch.setattr(gateway_cli, "_find_foreign_launchd_gateway_plist", lambda: ("com.example.gw", tmp_path / "com.example.gw.plist"))
+        with pytest.raises(SystemExit) as exc:
+            gateway_cli.launchd_install()
+        assert exc.value.code == 1
+        assert not (tmp_path / "ai.hermes.gateway.plist").exists()
+        captured = capsys.readouterr()
+        assert "com.example.gw" in captured.out + captured.err
+
+    @pytest.mark.macos_only
+    def test_get_service_pids_includes_foreign_job_pid(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "ai.hermes.gateway.plist")
+        monkeypatch.setattr(gateway_cli, "_find_foreign_launchd_gateway", lambda: ("com.example.gw", "gui/501", 4242))
+        assert 4242 in gateway_cli._get_service_pids(all_profiles=True)
+
+    def test_update_restarts_foreign_launchd_job(self, tmp_path, monkeypatch):
+        from hermes_cli import update_cmd
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "ai.hermes.gateway.plist")
+        monkeypatch.setattr(gateway_cli, "_launchd_service_registered", lambda label: False)
+        monkeypatch.setattr(gateway_cli, "launchd_gateway_labels_for_install", lambda: [])
+        monkeypatch.setattr(gateway_cli, "_find_foreign_launchd_gateway", lambda: ("com.example.gw", "gui/501", 4242))
+        calls = []
+        monkeypatch.setattr(gateway_cli, "_restart_foreign_launchd_gateway", lambda label, domain, pid: calls.append((label, domain, pid)))
+        restarted, failed = [], []
+
+        update_cmd._restart_macos_launchd_gateways(restarted, failed, 30.0)
+
+        assert calls == [("com.example.gw", "gui/501", 4242)]
+        assert restarted == ["com.example.gw"] and failed == []
+
+
 class TestDetectVenvDir:
     """Tests for _detect_venv_dir() virtualenv detection."""
 
