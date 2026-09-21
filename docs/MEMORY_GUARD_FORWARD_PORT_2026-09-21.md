@@ -95,3 +95,10 @@ neighbouring files 695 passed / 8 skipped; new layer test 4 passed.
 - `_would_overflow` replays the op with upstream's `_apply_batch_op`; if a future upstream
   `_apply_batch_op` signature changes, `test_memory_capacity_guard.py` fails first.
 - `tests/tools/test_memory_capacity_guard_layer.py` deliberately greps for the hook tags.
+- **Test-order hazard (upstream's, not the guard's):** `tests/tools/test_memory_tool_import_fallback.py`
+  re-imports `tools.memory_tool` without fcntl and only `sys.modules` is restored afterwards, not the
+  `tools.memory_tool` package attribute; any later test in the same process that uses
+  `MemoryStore._file_lock` then sees a no-lock module, so `TestMemoryFileLockPermissions` (3 tests)
+  fails. Reproduced on a pristine v2026.9.14 tree (`pytest test_memory_tool_import_fallback.py
+  test_memory_tool.py`). Default collection order (`test_memory_tool.py` first) is fine; a
+  locale-sorted file list that puts `_import_fallback` first is not. Sort with `LC_ALL=C`.
