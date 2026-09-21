@@ -70,8 +70,18 @@ Per conflicted file, decide in this order:
    `models_validate.py`, `tools/mcp_tool.py` → `mcp_tool_loop.py`, etc.). Anchor edits with
    asserted string replacements; fork-only logic goes into its own module when possible
    (e.g. `tools/mcp_tolerant_list.py`) so the next merge does not conflict.
-3. `tools/memory_tool.py` is the exception: ours wins wholesale (600-line capacity guard);
-   reverse-port upstream's functional fixes from `git log <base>..$T -- tools/memory_tool.py tools/memory_tool_store.py`.
+3. `tools/memory_tool.py` and `tools/memory_tool_store.py` take **upstream's version verbatim
+   except the tagged hooks**: `git checkout --theirs` (or `$T -- <file>`), then re-apply the
+   `# FORK(memory-capacity-guard):` hooks (`grep -rn "FORK(memory-capacity-guard)" tools/`; there are
+   two, both in `tools/memory_tool.py`, listed with the rationale in
+   `docs/MEMORY_GUARD_FORWARD_PORT_2026-09-21.md`). The guard itself lives in the fork-only
+   `tools/memory_capacity_guard.py` (`GuardedMemoryStore(MemoryStore)`), which never conflicts;
+   after a merge just check it still works against upstream's `MemoryStore` internals
+   (`_mutate`, `_edit`, `_apply_batch_op`, `_find_unique_match`, `_success_response`,
+   `_render_block`, `_read_raw_checked`, `_detect_external_drift`) via
+   `tests/tools/test_memory_capacity_guard*.py`, `test_memory_projection.py`,
+   `test_memory_pending_queue.py`, `test_memory_fault_path.py`, `test_write_approval.py`.
+   Do NOT hand-port upstream memory fixes into the fork any more; they arrive natively.
 4. Fork docs stay in `docs/` (upstream deleted it; git auto-moves them under `website/docs/`).
 5. Dep files: theirs. `apps/desktop/package.json` must match `package-lock.json`.
 
@@ -91,7 +101,7 @@ hermes_cli/update_cmd_fleet.py `_restart_foreign_launchd_gateway(f_label, f_doma
 gateway/run_shutdown.py `should_restart_after_signal()`; tools/mcp_tolerant_list.py +
 `install_tolerant_list_tools()` in tools/mcp_tool_loop.py; Telegram `_register_clipboard_copy`,
 `"cc:"` callback, `interactive_resume = False`; `full_width` in the three adapters and
-gateway/slash_commands_model.py; tools/memory_tool.py `apply_with_capacity`, `MEMORY_QUEUE_PCT`;
+gateway/slash_commands_model.py; tools/memory_capacity_guard.py `apply_with_capacity`, `MEMORY_QUEUE_PCT`, `GuardedMemoryStore` + tools/memory_tool.py `FORK(memory-capacity-guard)` hooks (2);
 tools/write_approval.py `_pq.enqueue(`; agent/moa_loop.py `_record_reference_cooldown`;
 hermes_cli/models_validate.py `_validate_discovery_disabled`; runtime_provider_custom.py
 `"x-api-key"`; runtime_provider.py `allow_paid_opencode_zen`; model_cost_guard.py `is_free_model`;
@@ -113,7 +123,7 @@ $P tests/hermes_cli/test_clinepass_command.py tests/gateway/test_clinepass_comma
    tests/gateway/test_choice_picker.py tests/gateway/test_telegram_clipboard_copy_button.py \
    tests/gateway/test_status_command.py tests/hermes_cli/test_commands.py \
    tests/hermes_cli/test_opencode_zen_free_keyless.py tests/hermes_cli/test_opencode_zen_free_policy.py \
-   tests/tools/test_memory_tool.py tests/tools/test_memory_capacity_guard.py tests/tools/test_memory_pending_queue.py \
+   tests/tools/test_memory_tool.py tests/tools/test_memory_capacity_guard.py tests/tools/test_memory_capacity_guard_layer.py tests/tools/test_memory_pending_queue.py \
    tests/tools/test_write_approval.py tests/agent/test_moa_reference_cooldown.py tests/tools/test_file_tools.py \
    tests/gateway/test_runner_startup_failures.py tests/gateway/test_shutdown_forensics.py   # gate (b)
 # gate (c): full suite, one chunk at a time (split tests/gateway, tests/hermes_cli, tests/agent+hermes_state,
