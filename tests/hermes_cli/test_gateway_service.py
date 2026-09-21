@@ -813,6 +813,125 @@ class TestGatewaySystemServiceRouting:
         assert run_calls == []
 
 
+class TestForeignLaunchdGateway:
+    """A LaunchAgent the operator manages under their own label (not
+    ``ai.hermes.gateway``) must be restarted through that label, never by
+    killing the process and running a foreground gateway against its
+    KeepAlive."""
+
+    def test_parse_launchd_label_for_pid(self):
+        out = "3635\t-15\tcom.example.hermes-gateway\n-\t0\tcom.example.other\n77\t0\tcom.apple.foo\n"
+        assert gateway_cli._parse_launchd_label_for_pid(out, 3635) == "com.example.hermes-gateway"
+        assert gateway_cli._parse_launchd_label_for_pid(out, 77) == "com.apple.foo"
+        assert gateway_cli._parse_launchd_label_for_pid(out, 1) is None
+        assert gateway_cli._parse_launchd_label_for_pid("", 3635) is None
+
+    def test_find_foreign_launchd_gateway_ignores_own_label(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 4242)
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, **kw: SimpleNamespace(returncode=0, stdout="4242\t0\tai.hermes.gateway\n"),
+        )
+        assert gateway_cli._find_foreign_launchd_gateway() is None
+
+    def test_find_foreign_launchd_gateway_resolves_label_and_domain(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 4242)
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, **kw: SimpleNamespace(returncode=0, stdout="4242\t-15\tcom.example.gw\n"),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_locate_launchd_gateway_service", lambda label: ("gui/501", 4242)
+        )
+        assert gateway_cli._find_foreign_launchd_gateway() == ("com.example.gw", "gui/501", 4242)
+
+    def test_restart_foreign_gateway_drains_then_relies_on_keepalive(self, monkeypatch, capsys):
+        calls = []
+        monkeypatch.setattr(gateway_cli, "_get_restart_exit_wait_budget", lambda: 27.0)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_graceful_restart_via_sigusr1",
+            lambda pid, timeout: calls.append(("graceful", pid, timeout)) or True,
+        )
+        monkeypatch.setattr(gateway_cli, "terminate_pid", lambda pid, force=False: calls.append(("term", pid, force)))
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_launchd_service_pid",
+            lambda label, old_pid, timeout, *, domain: calls.append(("wait_pid", label, old_pid, domain)) or True,
+        )
+        monkeypatch.setattr(gateway_cli, "_launchd_kickstart", lambda label, domain: calls.append(("kickstart", label, domain)))
+        monkeypatch.setattr(gateway_cli, "_launchd_print_service_pid", lambda domain, label: (True, 5150))
+
+        gateway_cli._restart_foreign_launchd_gateway("com.example.gw", "gui/501", 4242)
+
+        assert ("graceful", 4242, 27.0) in calls
+        assert not any(c[0] == "term" for c in calls)  # SIGUSR1 sufficed, no SIGTERM
+        assert not any(c[0] == "kickstart" for c in calls)  # KeepAlive respawned it
+        out = capsys.readouterr().out
+        assert "com.example.gw" in out and "5150" in out and "27" in out
+
+    def test_restart_foreign_gateway_kickstarts_when_keepalive_is_slow(self, monkeypatch):
+        calls = []
+        waits = iter([False, True])
+        monkeypatch.setattr(gateway_cli, "_get_restart_exit_wait_budget", lambda: 27.0)
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 5.0)
+        # SIGUSR1 could not be delivered -> SIGTERM fallback, then kickstart.
+        monkeypatch.setattr(gateway_cli, "_graceful_restart_via_sigusr1", lambda pid, timeout: False)
+        monkeypatch.setattr(gateway_cli, "terminate_pid", lambda pid, force=False: calls.append(("term", pid)))
+        monkeypatch.setattr(gateway_cli, "_wait_for_pid_exit", lambda pid, timeout: True)
+        monkeypatch.setattr(
+            gateway_cli, "_wait_for_launchd_service_pid", lambda label, old_pid, timeout, *, domain: next(waits)
+        )
+        monkeypatch.setattr(gateway_cli, "_launchd_kickstart", lambda label, domain: calls.append(("kickstart", label, domain)))
+        monkeypatch.setattr(gateway_cli, "_launchd_print_service_pid", lambda domain, label: (True, 5150))
+
+        gateway_cli._restart_foreign_launchd_gateway("com.example.gw", "gui/501", 4242)
+
+        assert calls == [("term", 4242), ("kickstart", "com.example.gw", "gui/501")]
+
+    @pytest.mark.macos_only
+    def test_gateway_restart_uses_foreign_launchd_job_instead_of_foreground(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "ai.hermes.gateway.plist")
+        monkeypatch.setattr(gateway_cli, "_find_foreign_launchd_gateway", lambda: ("com.example.gw", "gui/501", 4242))
+        restart_calls = []
+        monkeypatch.setattr(
+            gateway_cli, "_restart_foreign_launchd_gateway", lambda label, domain, pid: restart_calls.append((label, domain, pid))
+        )
+        run_calls = []
+        monkeypatch.setattr(gateway_cli, "run_gateway", lambda verbose=0, quiet=False, replace=False: run_calls.append(verbose))
+        monkeypatch.setattr(gateway_cli, "stop_profile_gateway", lambda: run_calls.append("stop") or True)
+
+        gateway_cli.gateway_command(SimpleNamespace(gateway_command="restart", system=False))
+
+        assert restart_calls == [("com.example.gw", "gui/501", 4242)]
+        assert run_calls == []
+
+    @pytest.mark.macos_only
+    def test_gateway_restart_exits_when_foreign_launchd_restart_fails(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "ai.hermes.gateway.plist")
+        monkeypatch.setattr(gateway_cli, "_find_foreign_launchd_gateway", lambda: ("com.example.gw", "gui/501", 4242))
+        monkeypatch.setattr(
+            gateway_cli,
+            "_restart_foreign_launchd_gateway",
+            lambda label, domain, pid: (_ for _ in ()).throw(
+                subprocess.CalledProcessError(5, ["launchctl", "kickstart", "-k", "gui/501/com.example.gw"])
+            ),
+        )
+        run_calls = []
+        monkeypatch.setattr(gateway_cli, "run_gateway", lambda verbose=0, quiet=False, replace=False: run_calls.append(verbose))
+
+        with pytest.raises(SystemExit) as exc:
+            gateway_cli.gateway_command(SimpleNamespace(gateway_command="restart", system=False))
+        assert exc.value.code == 1
+        assert run_calls == []
+
+
 class TestDetectVenvDir:
     """Tests for _detect_venv_dir() virtualenv detection."""
 

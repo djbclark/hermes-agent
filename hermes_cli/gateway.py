@@ -1512,6 +1512,112 @@ def _locate_launchd_gateway_service(label: str) -> tuple[str | None, int | None]
     return (None, None)
 
 
+def _parse_launchd_label_for_pid(output: str, pid: int) -> str | None:
+    """Return the label whose legacy ``launchctl list`` row carries ``pid``.
+
+    ``launchctl list`` prints one ``PID<TAB>Status<TAB>Label`` row per job in
+    the caller's domain, with ``-`` in the PID column for jobs without a live
+    process.
+    """
+    for line in (output or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            parts = line.split()
+        if len(parts) < 3:
+            continue
+        try:
+            row_pid = int(parts[0])
+        except ValueError:
+            continue
+        if row_pid == pid:
+            return parts[2].strip() or None
+    return None
+
+
+def _find_foreign_launchd_gateway() -> tuple[str, str, int] | None:
+    """Return ``(label, domain, pid)`` when a launchd job hermes did NOT
+    install supervises this profile's running gateway.
+
+    Some operators manage the gateway LaunchAgent themselves (Ansible, a
+    dotfiles repo, ...) under their own label rather than
+    ``ai.hermes.gateway``.  ``get_launchd_plist_path()`` then does not exist,
+    and the manual stop-then-foreground fallback in ``restart`` fights that
+    job's ``KeepAlive``: launchd respawns its copy within ``ThrottleInterval``
+    and the foreground gateway we just started is torn down (``--replace``)
+    or exits on "another gateway instance started during our startup".
+    Restarting through the owning label instead keeps launchd in charge.
+
+    Returns None when no such job owns the gateway PID (or off macOS).
+    """
+    if not is_macos():
+        return None
+    from gateway.status import get_running_pid
+
+    pid = get_running_pid()
+    if pid is None:
+        return None
+    try:
+        result = subprocess.run(
+            ["launchctl", "list"],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    label = _parse_launchd_label_for_pid(result.stdout, pid)
+    if not label or label == get_launchd_label():
+        return None
+    domain, _service_pid = _locate_launchd_gateway_service(label)
+    if domain is None:
+        domain = _probe_launchd_domain_for_label(label)
+    return (label, domain, pid)
+
+
+def _restart_foreign_launchd_gateway(label: str, domain: str, pid: int) -> None:
+    """Drain-then-relaunch a gateway owned by a non-hermes launchd job.
+
+    Mirrors ``launchd_restart()``'s drain step but never bootstraps our own
+    plist: the operator's job definition stays the single owner.  After the
+    old PID exits, an unconditional ``KeepAlive`` usually respawns the job on
+    its own; only when launchd has not done so do we ``kickstart`` it.
+    ``CalledProcessError``/``TimeoutExpired`` from ``launchctl`` propagate.
+    """
+    target = f"{domain}/{label}"
+    print(f"→ Gateway PID {pid} is supervised by launchd job {label} (restarting via {target})")
+    # SIGUSR1 = in-band graceful restart: the gateway refuses new turns,
+    # waits for in-flight work, then exits with the service-restart code
+    # (75), which an unconditional KeepAlive respawns.  Same drain-aware path
+    # the systemd branch uses; SIGTERM is only the fallback when SIGUSR1
+    # cannot be delivered or the gateway does not exit within the budget.
+    wait_budget = _get_restart_exit_wait_budget()
+    print(
+        f"→ Restarting gateway (PID {pid}) gracefully — waiting for in-flight runs "
+        f"(up to {wait_budget:.0f}s)..."
+    )
+    if not _graceful_restart_via_sigusr1(pid, wait_budget):
+        print(f"⚠ Gateway PID {pid} did not exit gracefully — sending SIGTERM")
+        try:
+            terminate_pid(pid, force=False)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        else:
+            drain_timeout = _get_restart_drain_timeout()
+            if not _wait_for_pid_exit(pid, max(drain_timeout, 1.0)):
+                print("⚠ Gateway still running after SIGTERM — forcing launchd restart")
+    # KeepAlive respawn is not instantaneous (ThrottleInterval); give it a
+    # moment before forcing a kickstart so we don't restart the job twice.
+    if not _wait_for_launchd_service_pid(label, pid, timeout=3.0, domain=domain):
+        _launchd_kickstart(label, domain)
+    if not _wait_for_launchd_service_pid(label, pid, timeout=15.0, domain=domain):
+        print(f"⚠ launchd job {label} has no fresh PID yet — check `hermes gateway status` or logs")
+        return
+    _loaded, new_pid = _launchd_print_service_pid(domain, label)
+    print(f"✓ Service restarted (launchd job {label}, PID {new_pid})")
+
+
 def _probe_launchd_service_running() -> bool:
     """Return True when launchd is actively supervising the gateway process.
 
@@ -8115,6 +8221,16 @@ def _gateway_command_inner(args):
                 service_available = True
             except subprocess.CalledProcessError:
                 pass
+        elif is_macos() and (foreign := _find_foreign_launchd_gateway()) is not None:
+            # Operator-managed LaunchAgent under a label of their own (see
+            # _find_foreign_launchd_gateway). Restart through it rather than
+            # killing the process and racing its KeepAlive with a foreground run.
+            service_configured = True
+            try:
+                _restart_foreign_launchd_gateway(*foreign)
+                service_available = True
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                pass
         elif is_windows():
             from hermes_cli import gateway_windows
 
@@ -8204,7 +8320,11 @@ def _gateway_command_inner(args):
             pids = list(snapshot.gateway_pids)
             if pids:
                 print(f"✓ Gateway is running (PID: {', '.join(map(str, pids))})")
-                print("  (Running manually, not as a system service)")
+                foreign = _find_foreign_launchd_gateway() if is_macos() else None
+                if foreign is not None:
+                    print(f"  (Supervised by launchd job {foreign[0]}, not a hermes-installed service)")
+                else:
+                    print("  (Running manually, not as a system service)")
                 runtime_lines = _runtime_health_lines()
                 if runtime_lines:
                     print()
