@@ -932,6 +932,106 @@ class TestForeignLaunchdGateway:
         assert run_calls == []
 
 
+class TestForeignLaunchdGatewayStopStart:
+    def _write_plist(self, path, label, args):
+        path.write_bytes(plistlib.dumps({"Label": label, "ProgramArguments": args}))
+
+    def test_find_foreign_plist_skips_own_label_and_non_gateway_jobs(self, tmp_path, monkeypatch):
+        agents = tmp_path / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True)
+        self._write_plist(agents / "ai.hermes.gateway.plist", "ai.hermes.gateway", ["/x/hermes", "gateway", "run"])
+        self._write_plist(agents / "com.example.other.plist", "com.example.other", ["/bin/echo", "gateway", "run"])
+        self._write_plist(agents / "com.example.gw.plist", "com.example.gw", ["/x/hermes", "gateway", "run", "--replace"])
+        (agents / "broken.plist").write_text("not a plist", encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
+
+        assert gateway_cli._find_foreign_launchd_gateway_plist() == ("com.example.gw", agents / "com.example.gw.plist")
+
+    def test_find_foreign_plist_none_when_absent(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
+        assert gateway_cli._find_foreign_launchd_gateway_plist() is None
+
+    def test_stop_foreign_gateway_boots_out_job(self, monkeypatch, capsys):
+        calls = []
+        monkeypatch.setattr(gateway_cli.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or SimpleNamespace(returncode=0))
+        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda timeout=10.0, force_after=5.0: calls.append("wait") or True)
+
+        gateway_cli._stop_foreign_launchd_gateway("com.example.gw", "gui/501", 4242)
+
+        assert ["launchctl", "bootout", "gui/501/com.example.gw"] in calls
+        assert "wait" in calls
+        assert "com.example.gw" in capsys.readouterr().out
+
+    def test_start_foreign_gateway_bootstraps_then_kickstarts(self, tmp_path, monkeypatch, capsys):
+        calls = []
+        plist = tmp_path / "com.example.gw.plist"
+        monkeypatch.setattr(gateway_cli, "_probe_launchd_domain_for_label", lambda label: "gui/501")
+        prints = iter([(False, None), (True, 5150)])
+        monkeypatch.setattr(gateway_cli, "_launchd_print_service_pid", lambda domain, label: next(prints))
+        monkeypatch.setattr(gateway_cli.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or SimpleNamespace(returncode=0))
+        monkeypatch.setattr(gateway_cli, "_wait_for_launchd_service_pid", lambda label, old_pid, timeout, *, domain: True)
+
+        gateway_cli._start_foreign_launchd_gateway("com.example.gw", plist)
+
+        assert calls == [
+            ["launchctl", "bootstrap", "gui/501", str(plist)],
+            ["launchctl", "kickstart", "gui/501/com.example.gw"],
+        ]
+        assert "5150" in capsys.readouterr().out
+
+    def test_start_foreign_gateway_is_idempotent_when_running(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(gateway_cli, "_probe_launchd_domain_for_label", lambda label: "gui/501")
+        monkeypatch.setattr(gateway_cli, "_launchd_print_service_pid", lambda domain, label: (True, 5150))
+        monkeypatch.setattr(gateway_cli.subprocess, "run", lambda cmd, **kw: calls.append(cmd))
+
+        gateway_cli._start_foreign_launchd_gateway("com.example.gw", tmp_path / "x.plist")
+
+        assert calls == []
+
+    @pytest.mark.macos_only
+    def test_gateway_stop_uses_foreign_job_not_pid_kill(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "ai.hermes.gateway.plist")
+        monkeypatch.setattr(gateway_cli, "_find_foreign_launchd_gateway", lambda: ("com.example.gw", "gui/501", 4242))
+        calls = []
+        monkeypatch.setattr(gateway_cli, "_stop_foreign_launchd_gateway", lambda label, domain, pid: calls.append(("stop", label)))
+        monkeypatch.setattr(gateway_cli, "stop_profile_gateway", lambda: calls.append("pidkill") or True)
+
+        gateway_cli.gateway_command(SimpleNamespace(gateway_command="stop", system=False))
+
+        assert calls == [("stop", "com.example.gw")]
+
+    @pytest.mark.macos_only
+    def test_gateway_start_loads_foreign_plist_instead_of_regenerating_own(self, tmp_path, monkeypatch):
+        plist = tmp_path / "com.example.gw.plist"
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "ai.hermes.gateway.plist")
+        monkeypatch.setattr(gateway_cli, "_find_foreign_launchd_gateway_plist", lambda: ("com.example.gw", plist))
+        calls = []
+        monkeypatch.setattr(gateway_cli, "_start_foreign_launchd_gateway", lambda label, path: calls.append(("start", label, path)))
+        monkeypatch.setattr(gateway_cli, "launchd_start", lambda: calls.append("launchd_start"))
+
+        gateway_cli.gateway_command(SimpleNamespace(gateway_command="start", system=False))
+
+        assert calls == [("start", "com.example.gw", plist)]
+
+    @pytest.mark.macos_only
+    def test_gateway_restart_starts_booted_out_foreign_job(self, tmp_path, monkeypatch):
+        plist = tmp_path / "com.example.gw.plist"
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "ai.hermes.gateway.plist")
+        monkeypatch.setattr(gateway_cli, "_find_foreign_launchd_gateway", lambda: None)
+        monkeypatch.setattr(gateway_cli, "_find_foreign_launchd_gateway_plist", lambda: ("com.example.gw", plist))
+        monkeypatch.setattr(gateway_cli, "find_gateway_pids", lambda: [])
+        calls = []
+        monkeypatch.setattr(gateway_cli, "_start_foreign_launchd_gateway", lambda label, path: calls.append(("start", label)))
+        monkeypatch.setattr(gateway_cli, "run_gateway", lambda verbose=0, quiet=False, replace=False: calls.append("foreground"))
+
+        gateway_cli.gateway_command(SimpleNamespace(gateway_command="restart", system=False))
+
+        assert calls == [("start", "com.example.gw")]
+
+
 class TestDetectVenvDir:
     """Tests for _detect_venv_dir() virtualenv detection."""
 

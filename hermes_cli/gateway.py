@@ -1618,6 +1618,88 @@ def _restart_foreign_launchd_gateway(label: str, domain: str, pid: int) -> None:
     print(f"✓ Service restarted (launchd job {label}, PID {new_pid})")
 
 
+def _find_foreign_launchd_gateway_plist() -> tuple[str, Path] | None:
+    """Return ``(label, plist_path)`` for an operator-managed gateway LaunchAgent.
+
+    Scans ``~/Library/LaunchAgents`` for a plist whose ``ProgramArguments``
+    run ``hermes ... gateway run`` under a label that is not one of ours
+    (``ai.hermes.gateway*``).  Unlike ``_find_foreign_launchd_gateway`` this
+    works while the job is booted out (no live PID), which is what ``start``
+    needs after a ``stop``.  First match in sorted filename order.
+    """
+    if not is_macos():
+        return None
+    import plistlib
+
+    agents_dir = _launchd_user_home() / "Library" / "LaunchAgents"
+    if not agents_dir.is_dir():
+        return None
+    for plist_path in sorted(agents_dir.glob("*.plist")):
+        try:
+            with plist_path.open("rb") as fh:
+                data = plistlib.load(fh)
+        except Exception:
+            continue
+        label = str(data.get("Label", "")).strip()
+        args = [str(a) for a in (data.get("ProgramArguments") or [])]
+        if not label or label.startswith("ai.hermes.gateway"):
+            continue
+        if "gateway" not in args or "run" not in args:
+            continue
+        if not any("hermes" in a for a in args):
+            continue
+        return (label, plist_path)
+    return None
+
+
+def _stop_foreign_launchd_gateway(label: str, domain: str, pid: int) -> None:
+    """Boot out an operator-managed gateway LaunchAgent so KeepAlive stays quiet.
+
+    A plain SIGTERM only signals the process; an unconditional ``KeepAlive``
+    respawns it within ``ThrottleInterval`` — which is why ``stop`` used to
+    look like a no-op here.  ``hermes gateway start`` re-bootstraps the
+    operator's own plist (``_start_foreign_launchd_gateway``).
+    """
+    target = f"{domain}/{label}"
+    print(f"→ Gateway PID {pid} is supervised by launchd job {label}; booting it out via {target}")
+    try:
+        from gateway.status import write_planned_stop_marker
+
+        write_planned_stop_marker(pid)
+    except Exception:
+        pass
+    try:
+        subprocess.run(["launchctl", "bootout", target], check=True, timeout=90)
+    except subprocess.CalledProcessError as e:
+        if not (_launchd_error_indicates_unloaded(e) or _launchctl_domain_unsupported(e.returncode)):
+            raise
+    _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+    print(f"✓ Stopped launchd job {label} (booted out; `hermes gateway start` reloads it)")
+
+
+def _start_foreign_launchd_gateway(label: str, plist_path: Path) -> None:
+    """Bootstrap + kickstart an operator-managed gateway LaunchAgent.
+
+    Never regenerates or rewrites the plist — the operator's file is the
+    single owner.  Idempotent when the job is already loaded and running.
+    """
+    domain = _probe_launchd_domain_for_label(label)
+    target = f"{domain}/{label}"
+    loaded, pid = _launchd_print_service_pid(domain, label)
+    if loaded and pid:
+        print(f"✓ Gateway already running (launchd job {label}, PID {pid})")
+        return
+    if not loaded:
+        print(f"→ Loading operator-managed launchd job {label} from {plist_path}")
+        subprocess.run(["launchctl", "bootstrap", domain, str(plist_path)], check=True, timeout=30)
+    subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
+    if _wait_for_launchd_service_pid(label, None, timeout=15.0, domain=domain):
+        _loaded, new_pid = _launchd_print_service_pid(domain, label)
+        print(f"✓ Service started (launchd job {label}, PID {new_pid})")
+    else:
+        print(f"⚠ launchd job {label} loaded but no PID yet — check `hermes gateway status` or logs")
+
+
 def _probe_launchd_service_running() -> bool:
     """Return True when launchd is actively supervising the gateway process.
 
@@ -7987,7 +8069,16 @@ def _gateway_command_inner(args):
         if supports_systemd_services():
             systemd_start(system=system)
         elif is_macos():
-            launchd_start()
+            foreign_plist = None
+            if not get_launchd_plist_path().exists():
+                # Operator-managed LaunchAgent under its own label: load THAT
+                # rather than regenerating ai.hermes.gateway.plist next to it
+                # (two KeepAlive jobs would --replace each other forever).
+                foreign_plist = _find_foreign_launchd_gateway_plist()
+            if foreign_plist is not None:
+                _start_foreign_launchd_gateway(*foreign_plist)
+            else:
+                launchd_start()
         elif is_windows():
             from hermes_cli import gateway_windows
 
@@ -8069,6 +8160,12 @@ def _gateway_command_inner(args):
                     service_available = True
                 except subprocess.CalledProcessError:
                     pass
+            elif is_macos() and (foreign := _find_foreign_launchd_gateway()) is not None:
+                try:
+                    _stop_foreign_launchd_gateway(*foreign)
+                    service_available = True
+                except subprocess.CalledProcessError:
+                    pass
             elif is_windows():
                 from hermes_cli import gateway_windows
 
@@ -8102,6 +8199,11 @@ def _gateway_command_inner(args):
                     service_available = True
                 except subprocess.CalledProcessError:
                     pass
+            elif is_macos() and (foreign := _find_foreign_launchd_gateway()) is not None:
+                # Operator-managed LaunchAgent (see _find_foreign_launchd_gateway):
+                # boot the job out; a PID kill would just be respawned by KeepAlive.
+                _stop_foreign_launchd_gateway(*foreign)
+                return
             elif is_windows():
                 from hermes_cli import gateway_windows
 
@@ -8228,6 +8330,20 @@ def _gateway_command_inner(args):
             service_configured = True
             try:
                 _restart_foreign_launchd_gateway(*foreign)
+                service_available = True
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                pass
+        elif (
+            is_macos()
+            and not get_launchd_plist_path().exists()
+            and _find_foreign_launchd_gateway_plist() is not None
+            and not find_gateway_pids()
+        ):
+            # Foreign job is booted out (after `hermes gateway stop`) and no
+            # gateway runs at all: restart == start the operator's job.
+            service_configured = True
+            try:
+                _start_foreign_launchd_gateway(*_find_foreign_launchd_gateway_plist())
                 service_available = True
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
                 pass
