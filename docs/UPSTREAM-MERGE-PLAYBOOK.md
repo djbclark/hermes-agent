@@ -11,8 +11,8 @@ every command was run as written. Read the latest `docs/handoffs/HANDOFF_*upstre
   during `-n 8` test runs (load average ~800). Run test chunks **one at a time**, under
   `nice -n 15`, with `-n 4` at most, never merged-tree and pristine-tree suites concurrently,
   and check `uptime` first (wait if the 1-minute load is above ~20).
-- Never merge in `~/.hermes/hermes-agent` (the checkout the gateway runs from). Work in a
-  worktree; promote by fast-forward only.
+- Never merge in `~/.hermes/hermes-agent` (the checkout the gateway runs from). Work in a cow
+  pasture (§3; a git worktree also works); promote by fast-forward only.
 - Never `hermes update` (syncs `origin` only, not fork-aware) and never `hermes gateway install`
   (a second KeepAlive job would fight `com.stayturgid.hermes-gateway`).
 - Never bare `git push` there: `main` tracks `upstream/main`. Always `git push origin main`.
@@ -28,33 +28,48 @@ git tag --sort=-creatordate | head -3          # newest RELEASE TAG is the targe
 T=v2026.9.14                                    # example
 git merge-base --is-ancestor $T upstream/main && echo tag-on-main
 git rev-parse --short HEAD                      # ROLLBACK POINT — write it down
-git merge-base main $T || echo EMPTY            # if EMPTY, see §2
+git rev-parse --is-shallow-repository           # must print false; if true see §2
+git merge-base main $T || echo EMPTY            # must print the previous upstream side; if EMPTY see §2
 ```
 
-## 2. Shallow clone surgery (needed when merge-base is EMPTY)
+## 2. Keeping the clone un-shallow (fixed 2026-09-21)
 
-The repo is a shallow clone. `hermes update`'s check path runs `git fetch --depth 1` and marks
-each fetched tip as a shallow boundary, so the fork's own commits end up in `.git/shallow` and
-`git log`/`merge-base` stop dead. Remove only boundaries whose parents exist locally:
+The clone used to be shallow: `hermes update` ran `git fetch --depth 1` and marked each fetched
+tip (including the fork's own commits) as a shallow boundary, which emptied `git merge-base`
+against upstream. On 2026-09-21 it was un-shallowed, so `git merge-base main <tag>` works
+directly and `hermes update` (never run it here, §0) would now do plain fetches. The fork
+watchdog (`check-gateway-fork-invariants.sh`) alerts if `.git/shallow` ever reappears. Repair:
 
 ```bash
-cp -p .git/shallow .git/shallow.bak-graft-$(date +%Y%m%d)
-while read s; do p=$(git cat-file -p $s | awk '/^parent/{print $2}'); ok=1
-  for q in $p; do git cat-file -e $q 2>/dev/null || ok=0; done
-  [ -n "$p" ] && [ $ok = 1 ] && echo "$s  (parents present: removable)"; done < .git/shallow
-# edit .git/shallow: delete ONLY the fork-tip lines listed above (ae230f072e, c4fc319704, 11e6f40d9a in 2026-09)
-git merge-base main $T                          # must print the previous merge's upstream side
+cd ~/.hermes/hermes-agent
+git fetch --unshallow origin; git fetch --unshallow upstream      # seconds each, ~50 MB
+git rev-parse --is-shallow-repository                              # true + one line left in .git/shallow?
+# A leftover boundary whose parents exist locally is stale. Move the file aside, verify, then delete:
+cp .git/shallow /tmp/shallow.bak && mv .git/shallow .git/shallow.disabled
+git rev-list --objects --missing=print --all | grep -c '^?'        # must print 0
+git fsck --connectivity-only --no-dangling                         # must be clean
+rm .git/shallow.disabled            # only if both passed; otherwise: mv .git/shallow.disabled .git/shallow
 ```
-Restore it byte-identical when done (`cp -p .git/shallow.bak-graft-* .git/shallow` after
-verifying with `diff`) and `git replace -d` anything you added. The `.git` dir is shared by all
-worktrees. (2026-08 needed a `git replace --graft` of the squashed root; since `22fedc8a36` the
-fork has real ancestry and only the shallow lines matter.)
+(`git --shallow-file=` is NOT a git option; do not try it.) Do the repair while no other git
+process or workspace is using this `.git`. Legacy note: before 2026-09-21 the fix was deleting
+only the fork-tip lines from `.git/shallow` for the merge and restoring the file afterwards
+(phase-2/3 handoffs describe it); `git replace --graft` never worked here because shallow
+boundaries override replace refs.
 
-## 3. Worktree, merge, conflict policy
+## 3. Pasture, merge, conflict policy
+
+A cow pasture (APFS copy-on-write clone) is the workspace: its own `.git` (nothing shared with the
+live repo), a full copy of the tree, and near-zero disk (measured 2026-09-21: creating and
+removing one changed free space by ~0.06 GB). `cow` symlinks large dirs (`.venv`, `venv`,
+`node_modules`) back to the source by default; use `--no-symlink` for a merge so `uv sync` in the
+pasture cannot touch the live venvs. The wrapper does not pass `--no-symlink`, so create with bare
+`cow`, then scrub secrets with the wrapper:
 
 ```bash
-git worktree add ~/.hermes/hermes-agent-worktrees/upstream-merge-$(date +%Y-%m) -b chore/upstream-merge-$(date +%Y-%m) main
-cd ~/.hermes/hermes-agent-worktrees/upstream-merge-*/
+YM=$(date +%Y-%m); W=~/orca/projects/djbclark-ade/bin/cow-pasture
+P=$(cow create upstream-merge-$YM --source ~/.hermes/hermes-agent --branch chore/upstream-merge-$YM --no-symlink --print-path | tail -1)
+$W scrub "$P"; cd "$P"      # removes gitignored secret-like files; add `$W trust "$P"` only for Claude Code sessions
+git rev-parse --is-shallow-repository                # false
 git diff --name-only $(git merge-base main $T) HEAD > /tmp/fork_delta.txt        # fork feature files
 git merge --no-commit --no-ff $T; git diff --name-only --diff-filter=U               # conflict list
 ```
@@ -114,7 +129,9 @@ cli_info_mixin, slash_commands_model, slash_commands_status, commands.py, comman
 ## 5. Verification gates (in order)
 
 ```bash
-uv sync --all-extras --no-extra matrix && uv pip install --python .venv/bin/python pytest-xdist pytest-timeout
+uv sync --frozen --all-extras --no-extra matrix && uv pip install --python .venv/bin/python pytest-xdist pytest-timeout
+# (`uv sync` removes the two plugins, reinstall them every time; it clones from the uv cache, ~free.)
+.venv/bin/python -c "import importlib.metadata as m; print(m.version('mcp'))"   # must equal the pyproject pin (2.0.0)
 export HERMES_HOME=$(mktemp -d)                                           # never the live ~/.hermes
 P="nice -n 15 .venv/bin/python -m pytest -q -p no:cacheprovider --timeout 180 --timeout-method=thread"
 $P tests/hermes_cli/test_gateway_service.py                                          # gate (a)
@@ -125,7 +142,8 @@ $P tests/hermes_cli/test_clinepass_command.py tests/gateway/test_clinepass_comma
    tests/hermes_cli/test_opencode_zen_free_keyless.py tests/hermes_cli/test_opencode_zen_free_policy.py \
    tests/tools/test_memory_tool.py tests/tools/test_memory_capacity_guard.py tests/tools/test_memory_capacity_guard_layer.py tests/tools/test_memory_pending_queue.py \
    tests/tools/test_write_approval.py tests/agent/test_moa_reference_cooldown.py tests/tools/test_file_tools.py \
-   tests/gateway/test_runner_startup_failures.py tests/gateway/test_shutdown_forensics.py   # gate (b)
+   tests/gateway/test_runner_startup_failures.py tests/gateway/test_shutdown_forensics.py \
+   tests/tools/test_mcp_tolerant_list.py   # gate (b); its lenient-listing tests skip unless mcp is 2.x
 # gate (c): full suite, one chunk at a time (split tests/gateway, tests/hermes_cli, tests/agent+hermes_state,
 # tests/tools into halves, then the rest; ~2-20 min each at -n 4). Collect FAILED/ERROR ids, re-run them
 # isolated on the merged tree, then the SAME ids on a pristine worktree of the tag with the same venv:
@@ -137,11 +155,16 @@ timeout 240 .venv/bin/python hermes -z "Reply with exactly: SMOKE-OK"           
 # gate (e): the §4 grep checklist; also slack_native_slashes() must be <= 50.
 ```
 
+Known quirk (upstream, reproduced on a pristine tag): if `test_memory_tool_import_fallback.py`
+runs before `test_memory_tool.py` in one process, 3 `TestMemoryFileLockPermissions` tests fail.
+Default collection order is fine; a locale-sorted file list triggers it (`LC_ALL=C sort` avoids it).
+The live dev venv `~/.hermes/hermes-agent/.venv` was rebuilt with the command above on
+2026-09-21 (it had lagged at mcp 1.28.1 and lacked xdist/timeout), so it can also run the gates.
+
 ## 6. Promotion and rollback
 
 ```bash
-cp -p ~/.hermes/hermes-agent/.git/shallow.bak-graft-* ~/.hermes/hermes-agent/.git/shallow   # restore first
-cd ~/.hermes/hermes-agent && git merge --ff-only chore/upstream-merge-<ym>
+cd ~/.hermes/hermes-agent && git fetch "$P" chore/upstream-merge-$YM && git merge --ff-only FETCH_HEAD   # live tree must be clean
 uv pip install -e '.[all]' --python venv/bin/python                     # runtime venv (what `hermes update` does)
 venv/bin/python -c "from hermes_cli.update_cmd_deps import _refresh_active_lazy_features as r; print(r())"   # refresh active lazy backends
 export PATH="$HOME/.local/bin:$PATH"; hermes gateway restart              # from a plain shell, never inside a Hermes session
@@ -151,7 +174,7 @@ tail -60 ~/.hermes/logs/gateway.log     # Telegram/Signal/Discord connected, "Ga
 grep -n shutdown_watchdog ~/.hermes/logs/gateway.log | tail -3
 bash ~/.hermes/scripts/check-gateway-fork-invariants.sh; bash ~/.hermes/scripts/check-hindsight-hook-invariants.sh   # both silent
 HERMES_HOME=$(mktemp -d) venv/bin/python -m pytest ~/.hermes/plugins/hindsight-retention-pilot/tests -q
-git push origin main && git push origin chore/upstream-merge-<ym>
+git push origin main && git -C "$P" push origin chore/upstream-merge-$YM
 ```
 Rollback if any check fails: `git reset --hard <ROLLBACK_SHA>` in the live checkout,
 `uv pip install -e '.[all]' --python venv/bin/python`, `hermes gateway restart`, re-check status.
@@ -163,5 +186,18 @@ Rollback if any check fails: `git reset --hard <ROLLBACK_SHA>` in the live check
 - `~/.hermes/scripts/check-gateway-fork-invariants.sh`: update symbol/file checks if a fork helper
   moved (2026-09: update restart moved to `update_cmd_fleet.py`); commit only that file in `~/.hermes`.
 - `~/.hermes/skills/hermes/hermes-install-lifecycle/SKILL.md` points here.
-- Delete the worktrees (`git worktree remove ...`) and the shallow backup once `diff` confirms it.
+- After a day's soak: `$W remove upstream-merge-$YM` (handles the immutable-flag files; `--force` if
+  it is dirty), then `git branch -d` the merged local branches. Do NOT bulk-delete other local
+  branches: several `fix/*`/`feat/*` branches hold commits that are not in `main` (list them with
+  `git rev-list --count main..<branch>`); review before pruning.
 - Watch the gateway log for a day (tolerant MCP list: a dropped-tool warning, not a dead server).
+
+## 8. Disk notes (measured 2026-09-21)
+
+- Pastures cost ~nothing; stale pastures and worktrees are what cost disk. Removing the nine old
+  fork-feature pastures freed ~3.6 GB, the two worktrees ~0.8 GB, aborted-fetch `tmp_pack_*`
+  debris in `.git/objects/pack` another ~0.55 GB (`git count-objects -v` warns "garbage found").
+- `cow stats` "On disk" is `du`-style (counts shared blocks), so judge savings with `df`, before and
+  after, not with that column. `cow gc --merged --dry-run` lists pastures whose branch merged.
+- Check every pasture's HEAD is reachable from a live-repo branch before removing it
+  (`git branch -a --contains <sha>`); only un-shallowed history makes that check trustworthy.
