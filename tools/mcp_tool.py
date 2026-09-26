@@ -128,9 +128,9 @@ def _import_sdk_names(module: str, names: tuple, missing_msg: Optional[str] = No
     try:
         mod = importlib.import_module(module)
         values = {n: getattr(mod, n) for n in names}
-    except (ImportError, AttributeError):
+    except (ImportError, AttributeError) as exc:
         if missing_msg:
-            logger.debug(missing_msg)
+            logger.debug("%s: %s", missing_msg, exc)
         return False
     globals().update(values)
     return True
@@ -146,17 +146,31 @@ def _ensure_mcp_sdk() -> bool:
     global _JSONRPC_METHOD_NOT_FOUND
     if not _MCP_AVAILABLE:
         return False
-    if _MCP_SDK_IMPORT_ATTEMPTED or ClientSession is not None:
+    # Only `_MCP_SDK_IMPORT_ATTEMPTED` means "finished". `ClientSession is not None`
+    # is true *mid-import* (the first `_import_sdk_names` binds it before HTTP), and
+    # an unlocked read of that made parallel HTTP servers raise "Upgrade the mcp
+    # package to get HTTP support" while a sibling still held the lock. Tests that
+    # pre-bind ClientSession as a mock are handled inside the lock below.
+    if _MCP_SDK_IMPORT_ATTEMPTED:
         return _MCP_AVAILABLE
     with _MCP_SDK_IMPORT_LOCK:
-        if _MCP_SDK_IMPORT_ATTEMPTED or ClientSession is not None:
+        if _MCP_SDK_IMPORT_ATTEMPTED:
             return _MCP_AVAILABLE
-        if (_import_sdk_names("mcp", ("ClientSession", "StdioServerParameters"))
-                and _import_sdk_names("mcp.client.stdio", ("stdio_client",))):
+        
+        if ClientSession is not None:
             _MCP_AVAILABLE = True
+        else:
+            if (_import_sdk_names("mcp", ("ClientSession", "StdioServerParameters"))
+                    and _import_sdk_names("mcp.client.stdio", ("stdio_client",))):
+                _MCP_AVAILABLE = True
+            else:
+                logger.debug("mcp package not installed -- MCP tool support disabled")
+                
+        if _MCP_AVAILABLE:
             # mcp >= 1.24 ships streamable_http_client; 2.0 dropped the deprecated
             # streamablehttp_client alias. Either one gives HTTP.
-            _MCP_NEW_HTTP = _import_sdk_names("mcp.client.streamable_http", ("streamable_http_client",))
+            _MCP_NEW_HTTP = _import_sdk_names("mcp.client.streamable_http", ("streamable_http_client",),
+                                              "mcp.client.streamable_http.streamable_http_client not available -- HTTP transport disabled")
             _MCP_LEGACY_HTTP = _import_sdk_names("mcp.client.streamable_http", ("streamablehttp_client",))
             _MCP_HTTP_AVAILABLE = _MCP_NEW_HTTP or _MCP_LEGACY_HTTP
             _import_sdk_names("mcp.types", ("LATEST_PROTOCOL_VERSION",),
@@ -169,9 +183,6 @@ def _ensure_mcp_sdk() -> bool:
                 sse_client = None
             _MCP_SAMPLING_TYPES, _MCP_ELICITATION_TYPES, _MCP_NOTIFICATION_TYPES = [
                 _import_sdk_names(*family) for family in _OPTIONAL_TYPE_FAMILIES]
-        else:
-            logger.debug("mcp package not installed -- MCP tool support disabled")
-        if _MCP_AVAILABLE:
             try:
                 _JSONRPC_METHOD_NOT_FOUND = importlib.import_module("mcp.types").METHOD_NOT_FOUND
             except Exception:  # pragma: no cover — SDK without the constant

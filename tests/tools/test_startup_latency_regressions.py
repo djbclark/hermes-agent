@@ -170,6 +170,118 @@ class TestLazyMcpSdk:
         # original) must materialize the symbol instead of AttributeError.
         assert getattr(mcp_tool, "StdioServerParameters") is not None
 
+    def test_parallel_ensure_does_not_skip_http_when_clientsession_appears(self):
+        """Waiters must not treat a mid-import ClientSession as 'SDK ready'.
+
+        Unlocked `ClientSession is not None` made HTTP MCP servers raise
+        "Upgrade the mcp package to get HTTP support" while a sibling was
+        still importing streamable_http — the package was already installed.
+        """
+        import importlib.util
+        from tools import mcp_tool
+
+        if importlib.util.find_spec("mcp") is None:
+            pytest.skip("mcp SDK not installed")
+        if importlib.util.find_spec("mcp.client.streamable_http") is None:
+            pytest.skip("mcp HTTP extra not installed")
+
+        mcp_tool._MCP_SDK_IMPORT_ATTEMPTED = False
+        mcp_tool.ClientSession = None
+        mcp_tool.stdio_client = None
+        mcp_tool._MCP_HTTP_AVAILABLE = False
+        mcp_tool._MCP_NEW_HTTP = False
+        mcp_tool._MCP_LEGACY_HTTP = False
+
+        original_import = mcp_tool._import_sdk_names
+        bound_clientsession = threading.Event()
+
+        def slow_import(module, names, missing_msg=None):
+            result = original_import(module, names, missing_msg)
+            if module == "mcp" and "ClientSession" in names:
+                bound_clientsession.set()
+                time.sleep(0.2)
+            return result
+
+        http_seen = []
+
+        def waiter():
+            bound_clientsession.wait(timeout=2)
+            mcp_tool._ensure_mcp_sdk()
+            http_seen.append(mcp_tool._MCP_HTTP_AVAILABLE)
+
+        t = threading.Thread(target=waiter)
+        with patch.object(mcp_tool, "_import_sdk_names", slow_import):
+            t.start()
+            assert mcp_tool._ensure_mcp_sdk() is True
+            t.join(timeout=3)
+        assert not t.is_alive()
+        assert mcp_tool._MCP_HTTP_AVAILABLE is True
+        assert http_seen == [True]
+        # Leave the module in the post-ensure state later tests expect.
+        mcp_tool._MCP_SDK_IMPORT_ATTEMPTED = False
+        mcp_tool.ClientSession = None
+        assert mcp_tool._ensure_mcp_sdk() is True
+
+    def test_prebound_clientsession_still_probes_http(self):
+        """If ClientSession is already bound (e.g. by a mock before mcp was loaded),
+        _ensure_mcp_sdk should still probe for the optional HTTP transports."""
+        import importlib.util
+        from tools import mcp_tool
+
+        if importlib.util.find_spec("mcp") is None:
+            pytest.skip("mcp SDK not installed")
+        if importlib.util.find_spec("mcp.client.streamable_http") is None:
+            pytest.skip("mcp HTTP extra not installed")
+
+        mcp_tool._MCP_SDK_IMPORT_ATTEMPTED = False
+        mcp_tool._MCP_HTTP_AVAILABLE = False
+        mcp_tool.ClientSession = object()  # pre-bind
+
+        try:
+            assert mcp_tool._ensure_mcp_sdk() is True
+            assert mcp_tool._MCP_HTTP_AVAILABLE is True
+        finally:
+            mcp_tool._MCP_SDK_IMPORT_ATTEMPTED = False
+            mcp_tool.ClientSession = None
+            mcp_tool._ensure_mcp_sdk()
+
+    @pytest.mark.asyncio
+    async def test_run_http_last_chance_import(self):
+        """If _MCP_HTTP_AVAILABLE is False because HTTP was installed after the gateway
+        started, _run_http should probe it one last time before raising."""
+        import importlib.util
+        from tools import mcp_tool
+        from tools.mcp_tool_transport import MCPServerTransportMixin
+
+        if importlib.util.find_spec("mcp") is None:
+            pytest.skip("mcp SDK not installed")
+        if importlib.util.find_spec("mcp.client.streamable_http") is None:
+            pytest.skip("mcp HTTP extra not installed")
+
+        class DummyServer(MCPServerTransportMixin):
+            name = "dummy"
+            def __init__(self):
+                pass
+            async def _serve_transport(self, transport_cm, label, connect_timeout):
+                return "served"
+
+        server = DummyServer()
+        server._sse_fallback = False
+        server._ever_connected = False
+        server._auth_type = None
+
+        mcp_tool._MCP_SDK_IMPORT_ATTEMPTED = True
+        mcp_tool._MCP_HTTP_AVAILABLE = False
+
+        try:
+            result = await server._run_http({"url": "http://localhost", "connect_timeout": 1})
+            assert result == "served"
+            assert mcp_tool._MCP_HTTP_AVAILABLE is True
+        finally:
+            mcp_tool._MCP_SDK_IMPORT_ATTEMPTED = False
+            mcp_tool.ClientSession = None
+            mcp_tool._ensure_mcp_sdk()
+
 
 class TestBannerUpdateCheckNonBlocking:
     def test_banner_does_not_block_on_pending_update_check(self):
