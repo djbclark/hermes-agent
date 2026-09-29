@@ -125,6 +125,7 @@ interface SlashActionCtx {
   name: string
   recordInput: boolean
   sessionHint?: string
+  timeoutMs?: number
 }
 
 interface SlashCommandDeps {
@@ -379,10 +380,13 @@ export function useSlashCommand(deps: SlashCommandDeps) {
         }
 
         try {
-          const result = await requestGateway<unknown>('slash.exec', {
+          const payload = {
             session_id: sessionId,
             command: command.replace(/^\/+/, '')
-          })
+          }
+          const result = ctx.timeoutMs
+            ? await requestGateway<unknown>('slash.exec', payload, ctx.timeoutMs)
+            : await requestGateway<unknown>('slash.exec', payload)
 
           const dispatch = parseCommandDispatch(result)
 
@@ -1190,8 +1194,15 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           return
         }
 
-        const ctx: SlashActionCtx = { arg, command, name, recordInput, sessionHint }
         const surface = resolveDesktopCommand(`/${name}`)?.surface
+        const ctx: SlashActionCtx = {
+          arg,
+          command,
+          name,
+          recordInput,
+          sessionHint,
+          timeoutMs: surface?.kind === 'exec' ? surface.timeoutMs : undefined
+        }
 
         switch (surface?.kind) {
           case 'unavailable': {

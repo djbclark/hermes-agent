@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   type CommandCatalogMeta,
   type CommandsCatalogLike,
+  AIUSE_SLASH_TIMEOUT_MS,
   desktopSkinSlashCompletions,
   type DesktopSlashArgumentMode,
   desktopSlashCommandArgumentMode,
@@ -91,6 +92,12 @@ describe('desktop slash command curation', () => {
     expect(isDesktopSlashCommand('/review')).toBe(true)
     expect(resolveDesktopCommand('/review')?.surface).toEqual({ kind: 'exec' })
     expect(resolveDesktopCommand('/review')?.argumentMode).toBe('text')
+    expect(isDesktopSlashSuggestion('/aiuse')).toBe(true)
+    expect(isDesktopSlashCommand('/aiuse')).toBe(true)
+    expect(resolveDesktopCommand('/aiuse')?.surface).toEqual({
+      kind: 'exec',
+      timeoutMs: AIUSE_SLASH_TIMEOUT_MS
+    })
   })
 
   it('treats registry and plugin commands as exec when the catalog says so', () => {

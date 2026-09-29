@@ -62,3 +62,24 @@ def test_run_aiuse_reports_nonzero_with_stderr(monkeypatch) -> None:
     )
 
     assert run_aiuse_for_chat() == "❌ `aiuse` failed (exit 2). collector unavailable"
+
+
+def test_run_aiuse_returns_stdout_even_on_alert_exit(monkeypatch) -> None:
+    monkeypatch.setattr("hermes_cli.aiuse_command.shutil.which", lambda name: "/bin/aiuse")
+    monkeypatch.setattr(
+        "hermes_cli.aiuse_command.subprocess.run",
+        lambda args, **kwargs: subprocess.CompletedProcess(
+            args, 2, stdout="- live usage with alerts\n", stderr="collector warning"
+        ),
+    )
+
+    assert run_aiuse_for_chat() == "- live usage with alerts"
+
+
+def test_aiuse_is_in_gateway_plain_command_table() -> None:
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    handlers = runner._gateway_plain_command_handlers()
+    assert handlers.get("aiuse") == runner._handle_aiuse_command
+

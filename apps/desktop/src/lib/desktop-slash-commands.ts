@@ -105,7 +105,7 @@ export type DesktopCommandSurface =
       timeoutMs?: number
       buildParams: (ctx: SlashCommandBuildCtx) => Record<string, unknown>
     }
-  | { kind: 'exec' }
+  | { kind: 'exec'; timeoutMs?: number }
   | { kind: 'unavailable'; reason: DesktopUnavailableReason }
 
 /**
@@ -147,7 +147,10 @@ export interface DesktopCommandSpec {
   argumentMode?: DesktopSlashArgumentMode
 }
 
-const exec = (): DesktopCommandSurface => ({ kind: 'exec' })
+export const AIUSE_SLASH_TIMEOUT_MS = 90_000
+
+const exec = (timeoutMs?: number): DesktopCommandSurface =>
+  timeoutMs == null ? { kind: 'exec' } : { kind: 'exec', timeoutMs }
 const action = (id: DesktopActionId): DesktopCommandSurface => ({ kind: 'action', action: id })
 const picker = (id: DesktopPickerId): DesktopCommandSurface => ({ kind: 'picker', picker: id })
 const unavailable = (reason: DesktopUnavailableReason): DesktopCommandSurface => ({ kind: 'unavailable', reason })
@@ -269,6 +272,14 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
     description: 'Generate a new pet (opens the pet generator)',
     aliases: ['/generate-pet'],
     surface: action('hatch')
+  },
+  {
+    name: '/aiuse',
+    description: 'Show live AI subscription and API usage',
+    // Collection routinely outlives the 30s desktop WS default (and the 45s
+    // slash-worker pipe). Keep slash.exec, but give the RPC a budget above
+    // `run_aiuse_for_chat`'s 60s subprocess cap.
+    surface: exec(AIUSE_SLASH_TIMEOUT_MS)
   },
   {
     name: '/save',

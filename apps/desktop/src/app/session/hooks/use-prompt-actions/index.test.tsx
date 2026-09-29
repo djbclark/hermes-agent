@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { getSession } from '@/hermes'
 import { textPart } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { AIUSE_SLASH_TIMEOUT_MS } from '@/lib/desktop-slash-commands'
 import { $composerAttachments, $composerDraft, type ComposerAttachment, setComposerDraft } from '@/store/composer'
 import { $queuedPromptsBySession, getQueuedPrompts } from '@/store/composer-queue'
 import { requestGatewayForAgent } from '@/store/gateway'
@@ -1323,6 +1324,31 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     })
     expect(persistedModes.get(focusedProfile)).toBe('off')
     expect(persistedModes.has('default')).toBe(false)
+  })
+
+  it('gives /aiuse a collection-length slash.exec timeout', async () => {
+    const sessionId = 'aiuse-runtime-session'
+    const requestGateway = vi.fn(async () => ({ output: '- live usage' }) as never)
+    let handle: HarnessHandle | null = null
+
+    render(
+      <Harness
+        activeSessionId={sessionId}
+        activeSessionIdRef={{ current: sessionId }}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId={sessionId}
+      />
+    )
+
+    await handle!.submitText('/aiuse')
+
+    expect(requestGateway).toHaveBeenCalledWith(
+      'slash.exec',
+      { command: 'aiuse', session_id: sessionId },
+      AIUSE_SLASH_TIMEOUT_MS
+    )
   })
 
   it('submits /goal send directives returned directly by slash.exec instead of rendering no output', async () => {

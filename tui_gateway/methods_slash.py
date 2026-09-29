@@ -194,6 +194,13 @@ def _format_live_status_output(sid: str, session: dict, arg: str) -> str:
     return str(response.get("result", {}).get("output") or "")
 
 
+def _format_live_aiuse_output(sid: str, session, arg: str) -> str:
+    """Run ``aiuse --for-chat`` in-process. Collection often exceeds the slash-worker
+    pipe (45s) and the desktop WS default (30s), so this must not go through the worker."""
+    from hermes_cli.aiuse_command import run_aiuse_for_chat
+    return run_aiuse_for_chat()
+
+
 # name → (reply when there is no session, formatter(sid, session, arg) or a fixed reply).
 # A None no-session reply means the formatter handles a missing session itself.
 _LIVE_SLASH_OUTPUT = {
@@ -210,7 +217,8 @@ _LIVE_SLASH_OUTPUT = {
     "clear": (None, "Screen clear is terminal-only; desktop/TUI chat left unchanged."),
     "models": (None, "Use /model to view or switch the current model; desktop users can also open the model picker."),
     "rename": (None, "Use /title <name> to rename this session."),
-    "effort": (None, "Use /reasoning <effort> to change reasoning effort.")}
+    "effort": (None, "Use /reasoning <effort> to change reasoning effort."),
+    "aiuse": (None, _format_live_aiuse_output)}
 
 
 def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg: str) -> Optional[str]:
