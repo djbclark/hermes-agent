@@ -34,7 +34,7 @@ _EXTS_BY_LANGUAGE: Dict[str, Sequence[str]] = {
     "csharp": (".cs", ".csx"), "fsharp": (".fs", ".fsi", ".fsx"),
     "swift": (".swift",), "java": (".java",), "kotlin": (".kt", ".kts"),
     "yaml": (".yaml", ".yml"), "json": (".json",), "jsonc": (".jsonc",),
-    "lua": (".lua",), "php": (".php",), "prisma": (".prisma",), "dart": (".dart",),
+    "lua": (".lua",), "php": (".php",), "blade": (".blade.php",), "prisma": (".prisma",), "dart": (".dart",),
     "ocaml": (".ml", ".mli"),
     "shellscript": (".sh", ".bash", ".zsh"),
     "terraform": (".tf", ".tfvars"),
@@ -77,6 +77,8 @@ class ServerDef:
     # Server handles ``workspace/didChangeWorkspaceFolders``: one process serves every project root
     # (git worktrees included) as extra workspaceFolders instead of one process per root.
     multi_root: bool = False
+    # didOpen languageId; "" = derive from LANGUAGE_BY_EXT (custom servers name theirs in config).
+    language_id: str = ""
     # Extra wait budget (seconds) on top of the service default.  Used as
     # ``max(service wait_timeout, this)`` so a slow first index (rust-analyzer)
     # can publish without raising the global default for every language.
@@ -100,10 +102,16 @@ class ServerContext:
 
 # ---- helpers ----
 
+# Multi-part extensions that name a different language than their last segment: ``os.path.splitext``
+# would reduce ``home.blade.php`` to ``.php`` and hand Blade templates to the plain-PHP server.
+_COMPOUND_EXTS = (".blade.php",)
+
+
 def _file_ext_or_basename(path: str) -> str:
-    """Lower-cased extension, or the full basename for extensionless files (``Dockerfile``)."""
+    """Lower-cased extension (compound ones first), or the full basename for extensionless files (``Dockerfile``)."""
     base = os.path.basename(path)
-    return os.path.splitext(base)[1].lower() or base
+    lower = base.lower()
+    return next((c for c in _COMPOUND_EXTS if lower.endswith(c)), None) or os.path.splitext(base)[1].lower() or base
 
 
 def _which(*names: str) -> Optional[str]:
@@ -176,7 +184,7 @@ def _simple_spawn(server_id: str, which: Sequence[str], args: Sequence[str] = ()
 # Prefer basedpyright (brew) then classic pyright.  Server id stays ``pyright`` so
 # ``lsp.servers.pyright.command`` overrides keep working.
 _PYRIGHT_BINS = ("basedpyright-langserver", "basedpyright", "pyright-langserver", "pyright")
-_PYRIGHT_CLI_NAMES = {"pyright", "pyright.exe", "basedpyright", "basedpyright.exe"}
+_PYRIGHT_CLI_STEMS = {"pyright", "basedpyright"}
 _PYRIGHT_LANGSERVER_NAMES = ("basedpyright-langserver", "pyright-langserver")
 
 
@@ -184,12 +192,14 @@ def _spawn_pyright(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     bin_path = _find_binary(ctx, "pyright", _PYRIGHT_BINS, "pyright")
     if bin_path is None:
         return None
-    # CLI wrappers (``pyright`` / ``basedpyright``) ship the langserver as a sibling.
-    if os.path.basename(bin_path) in _PYRIGHT_CLI_NAMES:
+    # CLI wrappers (``pyright`` / ``basedpyright``) ship the langserver as a sibling — same
+    # suffix, since on Windows the bare sibling is npm's unrunnable POSIX shim.
+    stem, suffix = os.path.splitext(os.path.basename(bin_path))
+    if stem in _PYRIGHT_CLI_STEMS:
         directory = os.path.dirname(bin_path)
         bin_path = next(
-            (os.path.join(directory, name) for name in _PYRIGHT_LANGSERVER_NAMES
-             if os.path.exists(os.path.join(directory, name))),
+            (os.path.join(directory, name + suffix) for name in _PYRIGHT_LANGSERVER_NAMES
+             if os.path.exists(os.path.join(directory, name + suffix))),
             bin_path,
         )
     # Point pyright at the project venv; its default "python on PATH" rarely is.
@@ -223,6 +233,67 @@ def _spawn_bash_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
         _warn_once("shellcheck", "bash-language-server: shellcheck not found on PATH — diagnostics will be empty "
                    "until shellcheck is installed (apt: shellcheck, brew: shellcheck, scoop: shellcheck).")
     return _make_spec(root, ctx, "bash-language-server", [bin_path, "start"])
+
+
+_VUE_REINSTALL = (
+    "delete <HERMES_HOME>/lsp/node_modules/@vue and <HERMES_HOME>/lsp/bin/vue-language-server*, "
+    "then run: hermes lsp install vue-language-server"
+)
+_VUE_TUNNEL_MSG = (
+    "vue-language-server: the installed @vue/language-server is 3.x, which only works behind a client-hosted "
+    f"tsserver tunnel Hermes does not run — no diagnostics will arrive. Reinstall the self-hosting 2.x line: {_VUE_REINSTALL}"
+)
+_VUE_TSDK_MSG = (
+    "vue-language-server: no JavaScript TypeScript SDK (typescript/lib/typescript.js) next to the server or under "
+    f"the project's node_modules — diagnostics are skipped. Reinstall (the recipe co-installs one): {_VUE_REINSTALL}"
+)
+
+
+def _node_modules_trees(bin_path: str, root: str) -> List[str]:
+    """``node_modules`` trees that may hold the Vue server and its TypeScript SDK:
+    the launcher's own tree (symlinks resolved), Hermes staging, then the project's."""
+    from agent.lsp.install import hermes_lsp_bin_dir
+    trees = [str(hermes_lsp_bin_dir().parent / "node_modules"), os.path.join(root, "node_modules")]
+    real = os.path.realpath(bin_path)
+    marker = f"{os.sep}node_modules{os.sep}"
+    if (idx := real.rfind(marker)) >= 0:
+        trees.insert(0, real[: idx + len(marker) - 1])
+    return trees
+
+
+def _vue_server_major(trees: Sequence[str]) -> int:
+    """Major version of the first ``@vue/language-server`` found in ``trees``; 0 when unreadable."""
+    import json
+    for tree in trees:
+        try:
+            with open(os.path.join(tree, "@vue", "language-server", "package.json"), encoding="utf-8") as fh:
+                return int(str(json.load(fh).get("version", "")).split(".")[0])
+        except (OSError, ValueError):
+            continue
+    return 0
+
+
+def _typescript_sdk_dir(trees: Sequence[str]) -> Optional[str]:
+    """First ``typescript/lib`` in ``trees`` holding a JS ``typescript.js`` (TypeScript 7+ ships none)."""
+    cands = (os.path.join(tree, "typescript", "lib") for tree in trees)
+    return next((c for c in cands if os.path.isfile(os.path.join(c, "typescript.js"))), None)
+
+
+def _spawn_vue(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+    """Spawn @vue/language-server 2.x self-hosting TypeScript (``hybridMode`` off, explicit ``tsdk``)."""
+    bin_path = _find_binary(ctx, "vue-language-server", ("vue-language-server",), "@vue/language-server")
+    if bin_path is None:
+        return None
+    trees = _node_modules_trees(bin_path, root)
+    if _vue_server_major(trees) >= 3:
+        _warn_once("vue-tunnel", _VUE_TUNNEL_MSG)
+        return None
+    tsdk = _typescript_sdk_dir(trees)
+    if tsdk is None:
+        _warn_once("vue-tsdk", _VUE_TSDK_MSG)
+        return None
+    return _make_spec(root, ctx, "vue-language-server", [bin_path, "--stdio"],
+                      {"typescript": {"tsdk": tsdk}, "vue": {"hybridMode": False}})
 
 
 def _find_pses_bundle(ctx: ServerContext) -> Optional[str]:
@@ -393,7 +464,7 @@ SERVERS: List[ServerDef] = [
             "JavaScript/TypeScript — typescript-language-server", resolve_root=_root_typescript,
             which=("typescript-language-server",), build_spawn=_spawn_typescript, seed=True),
     _server("vue-language-server", (".vue",), "Vue.js — @vue/language-server", resolve_root=_root_typescript,
-            args=("--stdio",), install_pkg="@vue/language-server"),
+            build_spawn=_spawn_vue),
     _server("svelte-language-server", (".svelte",), "Svelte — svelte-language-server", resolve_root=_root_typescript,
             which=("svelteserver", "svelte-language-server"), args=("--stdio",), install_pkg="svelte-language-server"),
     _server("astro-language-server", (".astro",), "Astro — @astrojs/language-server", resolve_root=_root_typescript,
@@ -410,6 +481,9 @@ SERVERS: List[ServerDef] = [
     _server("lua-language-server", (".lua",), "Lua — lua-language-server",
             markers=[".luarc.json", ".luarc.jsonc", ".luacheckrc", ".stylua.toml", "stylua.toml", "selene.toml", "selene.yml"],
             install_pkg="lua-language-server"),
+    # Before intelephense: Blade templates are Laravel's, plain .php stays with intelephense.
+    _server("laravel-lsp", (".blade.php",), "Laravel Blade — laravel-lsp (manual: composer global require laravel/lsp)",
+            markers=["artisan", "composer.json", "composer.lock"], args=("lsp",)),
     _server("intelephense", (".php",), "PHP — intelephense", markers=["composer.json", "composer.lock", ".php-version"],
             args=("--stdio",), install_pkg="intelephense", base_init={"telemetry": {"enabled": False}}),
     _server("ocaml-lsp", (".ml", ".mli"), "OCaml — ocaml-lsp", markers=["dune-project", "dune-workspace", ".merlin", "opam"],
@@ -448,24 +522,62 @@ SERVERS: List[ServerDef] = [
 ]
 
 
-def find_servers_for_file(file_path: str) -> List[ServerDef]:
-    """Return every registry entry that handles ``file_path`` (possibly several, e.g. pyright + ruff)."""
-    return [srv for srv in SERVERS if srv.matches(file_path)]
+def find_servers_for_file(file_path: str, servers: Optional[Sequence[ServerDef]] = None) -> List[ServerDef]:
+    """Return every entry of ``servers`` (default: the built-in registry) that handles ``file_path``
+    (possibly several, e.g. pyright + ruff)."""
+    return [srv for srv in (SERVERS if servers is None else servers) if srv.matches(file_path)]
 
 
-def find_server_for_file(file_path: str) -> Optional[ServerDef]:
-    """Return the first registry entry that handles ``file_path``, or None."""
-    matched = find_servers_for_file(file_path)
+def find_server_for_file(file_path: str, servers: Optional[Sequence[ServerDef]] = None) -> Optional[ServerDef]:
+    """Return the first entry of ``servers`` (default: the built-in registry) that handles ``file_path``."""
+    matched = find_servers_for_file(file_path, servers)
     return matched[0] if matched else None
 
 
-def language_id_for(path: str) -> str:
-    """Return the LSP languageId to send in didOpen for ``path``."""
+def language_id_for(path: str, srv: Optional[ServerDef] = None) -> str:
+    """Return the LSP languageId to send in didOpen for ``path`` (a custom server's own id wins)."""
+    if srv is not None and srv.language_id:
+        return srv.language_id
     return LANGUAGE_BY_EXT.get(_file_ext_or_basename(path), "plaintext")
 
 
-__all__ = [
-    "ServerDef", "ServerContext", "SpawnSpec", "SERVERS",
-    "find_server_for_file", "find_servers_for_file", "language_id_for", "LANGUAGE_BY_EXT",
-    "RUST_ANALYZER_WAIT_TIMEOUT",
-]
+def _custom_spawn(server_id: str, command: Sequence[str]) -> _SpawnFn:
+    """Spawn builder for a config-declared server: ``command[0]`` is a path or a PATH lookup, no auto-install."""
+    def build(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+        bin_path = _which(os.path.expanduser(command[0]))
+        if bin_path is None:
+            _warn_once(f"custom:{server_id}", f"lsp.servers.{server_id}: command {command[0]!r} not found on PATH — server skipped")
+            return None
+        return _make_spec(root, ctx, server_id, [bin_path, *command[1:]])
+    return build
+
+
+def custom_servers(servers_cfg: Any) -> List[ServerDef]:
+    """``lsp.servers`` entries that declare ``extensions`` and name no built-in server are user-declared
+    servers (issue #100257).  They go AHEAD of the built-ins so a custom entry can claim an extension;
+    malformed entries are logged and skipped so one typo never disables the rest of the subsystem."""
+    if not isinstance(servers_cfg, dict):
+        return []
+    builtin = {s.server_id for s in SERVERS}
+    out: List[ServerDef] = []
+    for server_id, cfg in servers_cfg.items():
+        if server_id in builtin or not isinstance(cfg, dict) or "extensions" not in cfg:
+            continue
+        command, exts, markers = cfg.get("command"), cfg.get("extensions"), cfg.get("root_markers")
+        if not (isinstance(command, list) and command and all(isinstance(c, str) and c for c in command)
+                and isinstance(exts, list) and exts and all(isinstance(e, str) and e for e in exts)):
+            logger.warning("lsp.servers.%s: custom server needs command: [bin, ...args] and extensions: [.ext, ...] — ignored", server_id)
+            continue
+        out.append(ServerDef(
+            str(server_id), tuple(e.lower() if e.startswith(".") else e for e in exts),
+            _markers_root([str(m) for m in markers] if isinstance(markers, list) and markers else None),
+            _custom_spawn(str(server_id), command),
+            description=str(cfg.get("description") or f"{server_id} — custom (lsp.servers)"),
+            language_id=str(cfg.get("language_id") or ""),
+        ))
+    return out
+
+
+__all__ = ["ServerDef", "ServerContext", "SpawnSpec", "SERVERS", "custom_servers",
+           "find_server_for_file", "find_servers_for_file", "language_id_for", "LANGUAGE_BY_EXT",
+           "RUST_ANALYZER_WAIT_TIMEOUT"]

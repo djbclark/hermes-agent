@@ -519,13 +519,14 @@ class GuardedMemoryStore(_UpstreamMemoryStore):
         finally:
             _GUARD_OP.reset(token)
 
-    def _edit(self, target: str, old_text: str, new_content: Optional[str]) -> Dict[str, Any]:
+    def _edit(self, target: str, old_text: str, new_content: Optional[str],
+              matched_entry: Optional[str] = None) -> Dict[str, Any]:
         """Replace/remove. A capacity-increasing replace journals when at capacity;
         remove (``new_content is None``) is never journaled."""
         op = None if new_content is None else ("replace", {"old_text": old_text, "content": new_content})
         token = _GUARD_OP.set(op)
         try:
-            return super()._edit(target, old_text, new_content)
+            return super()._edit(target, old_text, new_content, matched_entry)
         finally:
             _GUARD_OP.reset(token)
 
@@ -559,8 +560,11 @@ class GuardedMemoryStore(_UpstreamMemoryStore):
             ops = [op or {} for op in payload["operations"]]
         for i, op in enumerate(ops):
             act = op.get("action")
-            if self._apply_batch_op(working, act, (op.get("content") or op.get("new_text") or "").strip(),
-                                    (op.get("old_text") or "").strip(), f"Operation {i + 1}"):
+            # Upstream returns (error, previous_content); only the error means "invalid op".
+            error, _previous = self._apply_batch_op(
+                working, act, (op.get("content") or op.get("new_text") or "").strip(),
+                (op.get("old_text") or "").strip(), f"Operation {i + 1}")
+            if error:
                 return False
         return bool(working) and len(ENTRY_DELIMITER.join(working)) > limit
 
@@ -789,8 +793,8 @@ class GuardedMemoryStore(_UpstreamMemoryStore):
         block = self._render_block(target, sanitized)
         return block if block else None
 
-    def _success_response(self, target: str, message: str = None) -> Dict[str, Any]:
-        resp = super()._success_response(target, message)
+    def _success_response(self, target: str, message: str = None, **extra) -> Dict[str, Any]:
+        resp = super()._success_response(target, message, **extra)
         # Capacity-awareness: surface queued count and warn when near the cap.
         current = self._char_count(target)
         limit = self._char_limit(target)
