@@ -50,18 +50,16 @@ concurrency:
 
 jobs:
   os-tests:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.marker == 'macos_only' && 'macOS-only tests' || 'Windows-only tests' }}
+    runs-on: ${{ matrix.marker == 'macos_only' && 'macos-latest' || 'windows-latest-32-core' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        # windows-latest-32-core exists only in the NousResearch org; a fork runs the macOS leg alone
-        # (a job-level `if:` cannot see the matrix, so the leg is dropped from the list instead).
-        include: >-
-          ${{ fromJSON(github.repository == 'NousResearch/hermes-agent'
-          && '[{"name":"macOS-only tests","runner":"macos-latest","marker":"macos_only"},{"name":"Windows-only tests","runner":"windows-latest-32-core","marker":"windows_only"}]'
-          || '[{"name":"macOS-only tests","runner":"macos-latest","marker":"macos_only"}]') }}
+        # windows-latest-32-core exists only in the NousResearch org; a fork runs the macOS leg alone.
+        # A job-level `if:` cannot see the matrix, and `include` re-adds anything `exclude` removed,
+        # so the leg is dropped from the vector itself.
+        marker: ${{ fromJSON(github.repository == 'NousResearch/hermes-agent' && '["macos_only","windows_only"]' || '["macos_only"]') }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
