@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import {
+  AIUSE_SLASH_TIMEOUT_MS,
   type CommandCatalogMeta,
   type CommandsCatalogLike,
-  AIUSE_SLASH_TIMEOUT_MS,
   desktopSkinSlashCompletions,
   type DesktopSlashArgumentMode,
   desktopSlashCommandArgumentMode,

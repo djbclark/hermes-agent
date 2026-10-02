@@ -281,7 +281,7 @@ cd ~/.hermes/hermes-agent-worktrees/upstream-merge   # or live checkout after cl
 # chunks: tests/tools (~27min) | tests/gateway tests/hermes_cli (~5min)
 #         | tests/agent tests/run_agent tests/hermes_state (~3min) | rest (~3min)
 # Triage raw failures by re-running them isolated, then diffing against
-# a pristine worktree: git worktree add /tmp/upstream-pristine <ref>
+# a pristine worktree: git worktree add "${TMPDIR:-/tmp}/upstream-pristine" <ref>
 
 # --- Gotchas carried forward (6848/7895, still true) -------------------
 # Never bare `git push` in ~/.hermes/hermes-agent — always `git push origin main`.
