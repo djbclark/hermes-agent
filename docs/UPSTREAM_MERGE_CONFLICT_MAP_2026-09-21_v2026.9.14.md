@@ -81,5 +81,5 @@ doc parity ×1); one more found earlier (`test_db_file_created_with_wal_and_rest
 fixed in `0df6696664`) and `_launchd_user_home` (same commit). The 92 environmental failures are
 identical on pristine: web dashboard tests (`_methods` SimpleNamespace), update autostash/self-lock
 git fixtures, dashboard param clamps, PTB polling-progress plugin import, tui_gateway projects RPC,
-voice/sounddevice, install.sh node/termux, cross-VM WAL, `/tmp`→`/private/tmp` path asserts in
+voice/sounddevice, install.sh node/termux, cross-VM WAL, `/tmp`→`/private/tmp` path asserts in <!-- no-tmp: ok — names upstream tests that fail on the macOS /tmp alias -->
 file_tools, code kernel, cua overlay, contributor map, etc.

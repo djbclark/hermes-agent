@@ -45,7 +45,7 @@ cd ~/.hermes/hermes-agent
 git fetch --unshallow origin; git fetch --unshallow upstream      # seconds each, ~50 MB
 git rev-parse --is-shallow-repository                              # true + one line left in .git/shallow?
 # A leftover boundary whose parents exist locally is stale. Move the file aside, verify, then delete:
-cp .git/shallow /tmp/shallow.bak && mv .git/shallow .git/shallow.disabled
+cp .git/shallow "${TMPDIR:-/tmp}/shallow.bak" && mv .git/shallow .git/shallow.disabled
 git rev-list --objects --missing=print --all | grep -c '^?'        # must print 0
 git fsck --connectivity-only --no-dangling                         # must be clean
 rm .git/shallow.disabled            # only if both passed; otherwise: mv .git/shallow.disabled .git/shallow
@@ -70,7 +70,7 @@ YM=$(date +%Y-%m); W=~/orca/projects/djbclark-ade/bin/cow-pasture
 P=$(cow create upstream-merge-$YM --source ~/.hermes/hermes-agent --branch chore/upstream-merge-$YM --no-symlink --print-path | tail -1)
 $W scrub "$P"; cd "$P"      # removes gitignored secret-like files; add `$W trust "$P"` only for Claude Code sessions
 git rev-parse --is-shallow-repository                # false
-git diff --name-only $(git merge-base main $T) HEAD > /tmp/fork_delta.txt        # fork feature files
+git diff --name-only $(git merge-base main $T) HEAD > "${TMPDIR:-/tmp}/fork_delta.txt"        # fork feature files
 git merge --no-commit --no-ff $T; git diff --name-only --diff-filter=U               # conflict list
 ```
 
@@ -150,7 +150,7 @@ $P tests/hermes_cli/test_clinepass_command.py tests/gateway/test_clinepass_comma
 git -C ~/.hermes/hermes-agent worktree add --detach ~/.hermes/hermes-agent-worktrees/upstream-pristine-$T $T
 # ids with spaces/braces: tr '\n' '\0' < ids.txt | xargs -0 nice -n 15 .venv/bin/python -m pytest ...
 # Only ids that fail on merged but pass on pristine are merge-caused. Expect ~90 environmental
-# failures identical on both (web dashboard, update autostash/self-lock, voice, install.sh, /tmp path asserts).
+# failures identical on both (web dashboard, update autostash/self-lock, voice, install.sh, /private/tmp alias asserts).
 timeout 240 .venv/bin/python hermes -z "Reply with exactly: SMOKE-OK"                # gate (d), live config
 # gate (e): the §4 grep checklist; also slack_native_slashes() must be <= 50.
 ```
