@@ -76,22 +76,44 @@ class TestTelegramSendClarify:
         kwargs = adapter._bot.send_message.call_args[1]
         assert kwargs["chat_id"] == 12345
         assert "Which option?" in kwargs["text"]
-        # Full option text rendered in the message body (not just buttons)
-        assert "1. alpha" in kwargs["text"]
-        assert "2. beta" in kwargs["text"]
-        assert "3. gamma" in kwargs["text"]
-        # InlineKeyboardMarkup with N+1 buttons (3 choices + Other)
+        # Choice text is on the buttons, not a numbered list in the body.
+        assert "1. alpha" not in kwargs["text"]
+        assert "2. beta" not in kwargs["text"]
         markup = kwargs["reply_markup"]
         assert markup is not None
-        # Mocked InlineKeyboardMarkup — just verify it was constructed
-        # with rows.  We check state instead of poking the mock structure.
+        rows = markup.inline_keyboard
+        assert [b.text for b in rows[0]] == ["alpha"]
+        assert [b.text for b in rows[1]] == ["beta"]
+        assert [b.text for b in rows[2]] == ["gamma"]
+        assert rows[0][0].callback_data == "cl:cid1:0"
+        assert rows[1][0].callback_data == "cl:cid1:1"
+        assert rows[2][0].callback_data == "cl:cid1:2"
+        assert rows[3][0].text.startswith("✏️")
+        assert rows[3][0].callback_data == "cl:cid1:other"
         assert "cid1" in adapter._clarify_state
         assert adapter._clarify_state["cid1"] == "sk1"
 
+    @pytest.mark.asyncio
+    async def test_long_choice_is_truncated_on_the_button(self):
+        adapter = _make_adapter()
+        mock_msg = MagicMock()
+        mock_msg.message_id = 101
+        adapter._bot.send_message = AsyncMock(return_value=mock_msg)
+        long_choice = "x" * 80
 
-        # The button label should be short ("1"), not the long choice
-        # (we can't inspect mock button labels directly, but the send
-        # succeeded — old truncation code could raise on edge cases)
+        await adapter.send_clarify(
+            chat_id="12345",
+            question="Pick",
+            choices=[long_choice],
+            clarify_id="cid-long",
+            session_key="sk-long",
+        )
+
+        kwargs = adapter._bot.send_message.call_args[1]
+        label = kwargs["reply_markup"].inline_keyboard[0][0].text
+        assert len(label) == TelegramAdapter._CLARIFY_BUTTON_MAX
+        assert label.endswith("…")
+        assert long_choice not in kwargs["text"]
 
     @pytest.mark.asyncio
     async def test_html_escapes_question(self):

@@ -4388,19 +4388,32 @@ class TelegramAdapter(BasePlatformAdapter):
         return await self._send_prompt(
             "send_slash_confirm", chat_id, metadata, build, thread_id=self._metadata_thread_id(metadata), reply_to_mode=self._reply_to_mode)
 
+    _CLARIFY_BUTTON_MAX = 64  # Telegram InlineKeyboardButton text cap
+
+    @classmethod
+    def _clarify_button_label(cls, choice: str) -> str:
+        """Button label is the choice text itself (not a number pointing at a list above)."""
+        text = str(choice).strip() or " "
+        if len(text) <= cls._CLARIFY_BUTTON_MAX:
+            return text
+        return text[: cls._CLARIFY_BUTTON_MAX - 1] + "…"
+
     async def send_clarify(
         self, chat_id: str, question: str, choices: Optional[list], clarify_id: str, session_key: str,
         metadata: Optional[Dict[str, Any]] = None) -> SendResult:
-        """Render a clarify prompt: numbered buttons per choice plus "✏️ Other (type answer)" (flips to
-        text-capture mode); without choices, plain question and the gateway text-intercept captures."""
+        """Render a clarify prompt: one full-width button per choice (label = choice text) plus
+        "✏️ Other (type answer)" (flips to text-capture mode); without choices, plain question and
+        the gateway text-intercept captures."""
         def build():
             text = f"❓ {_html.escape(question)}"
             keyboard = None
             if choices:
-                # Full option text in the body (mobile truncates button labels); buttons keep numeric labels.
-                text += "\n\n" + "\n".join(f"{i + 1}. {_html.escape(str(c))}" for i, c in enumerate(choices))
+                # Labels live on the buttons. Do not duplicate a numbered list in the body.
                 # Telegram caps callback_data at 64 bytes; keep "cl:<id>:<idx>" short.
-                rows = [[InlineKeyboardButton(str(idx + 1), callback_data=f"cl:{clarify_id}:{idx}")] for idx in range(len(choices))]
+                rows = [
+                    [InlineKeyboardButton(self._clarify_button_label(str(c)), callback_data=f"cl:{clarify_id}:{idx}")]
+                    for idx, c in enumerate(choices)
+                ]
                 rows.append([InlineKeyboardButton("✏️ Other (type answer)", callback_data=f"cl:{clarify_id}:other")])
                 keyboard = InlineKeyboardMarkup(rows)
             return text, keyboard, lambda msg: self._clarify_state.__setitem__(clarify_id, session_key)
