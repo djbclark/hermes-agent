@@ -25,7 +25,7 @@ if _repo not in sys.path:
 # Minimal Telegram mock so TelegramAdapter can be imported (mirrors
 # test_telegram_approval_buttons.py)
 # ---------------------------------------------------------------------------
-from plugins.platforms.telegram.adapter import TelegramAdapter
+from plugins.platforms.telegram.adapter import InlineKeyboardButton, TelegramAdapter
 from gateway.config import PlatformConfig
 
 
@@ -54,6 +54,7 @@ class TestTelegramSendClarify:
 
     def setup_method(self):
         _clear_clarify_state()
+        InlineKeyboardButton.reset_mock()
 
     @pytest.mark.asyncio
     async def test_multi_choice_renders_buttons_and_other(self):
@@ -79,17 +80,13 @@ class TestTelegramSendClarify:
         # Choice text is on the buttons, not a numbered list in the body.
         assert "1. alpha" not in kwargs["text"]
         assert "2. beta" not in kwargs["text"]
-        markup = kwargs["reply_markup"]
-        assert markup is not None
-        rows = markup.inline_keyboard
-        assert [b.text for b in rows[0]] == ["alpha"]
-        assert [b.text for b in rows[1]] == ["beta"]
-        assert [b.text for b in rows[2]] == ["gamma"]
-        assert rows[0][0].callback_data == "cl:cid1:0"
-        assert rows[1][0].callback_data == "cl:cid1:1"
-        assert rows[2][0].callback_data == "cl:cid1:2"
-        assert rows[3][0].text.startswith("✏️")
-        assert rows[3][0].callback_data == "cl:cid1:other"
+        assert kwargs["reply_markup"] is not None
+        labels = [c.args[0] for c in InlineKeyboardButton.call_args_list]
+        datas = [c.kwargs.get("callback_data") for c in InlineKeyboardButton.call_args_list]
+        assert labels[:3] == ["alpha", "beta", "gamma"]
+        assert datas[:3] == ["cl:cid1:0", "cl:cid1:1", "cl:cid1:2"]
+        assert labels[3].startswith("✏️")
+        assert datas[3] == "cl:cid1:other"
         assert "cid1" in adapter._clarify_state
         assert adapter._clarify_state["cid1"] == "sk1"
 
@@ -100,6 +97,7 @@ class TestTelegramSendClarify:
         mock_msg.message_id = 101
         adapter._bot.send_message = AsyncMock(return_value=mock_msg)
         long_choice = "x" * 80
+        InlineKeyboardButton.reset_mock()
 
         await adapter.send_clarify(
             chat_id="12345",
@@ -110,7 +108,7 @@ class TestTelegramSendClarify:
         )
 
         kwargs = adapter._bot.send_message.call_args[1]
-        label = kwargs["reply_markup"].inline_keyboard[0][0].text
+        label = InlineKeyboardButton.call_args_list[0].args[0]
         assert len(label) == TelegramAdapter._CLARIFY_BUTTON_MAX
         assert label.endswith("…")
         assert long_choice not in kwargs["text"]
