@@ -1,5 +1,6 @@
 {
   "/agents": null,
+  "/aiuse": null,
   "/approvals": null,
   "/approve": "messaging",
   "/battery": null,
@@ -12,6 +13,7 @@
   "/bundles": null,
   "/busy": "terminal",
   "/clear": "terminal",
+  "/clinepass": null,
   "/codex-runtime": null,
   "/codex_runtime": null,
   "/commands": null,
