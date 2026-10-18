@@ -10,6 +10,10 @@ if [ -d /mnt/fast/tmp ]; then
   export HERMES_HOME="${HERMES_HOME:-/mnt/fast/home/.hermes}"
   mkdir -p "$TMPDIR" "$HERMES_HOME"
 fi
+# Run 9 died with EMFILE (Error 24) near the end: 508 files never collected and
+# post-job git failed loading libc. Raise the soft nofile ceiling for this job.
+ulimit -n 1048576 2>/dev/null || ulimit -n 65536 2>/dev/null || true
+echo "BENCHSTEP ulimit nofile=$(ulimit -n)"
 echo "BENCHSTEP start setup ref=${TARGET_REF:-unknown}"
 echo "ref ${TARGET_REF:-} is $(git -C target rev-parse HEAD)"
 git -C target log -1 --format='%h %s'
