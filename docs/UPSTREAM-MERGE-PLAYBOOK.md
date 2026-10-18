@@ -4,6 +4,9 @@ Distilled from the 2026-08-22 (v2026.8.19) and 2026-09-21 (v2026.9.14) merges. C
 every command was run as written. Read the latest `docs/handoffs/HANDOFF_*upstream-merge*` and
 `docs/UPSTREAM_MERGE_CONFLICT_MAP_*.md` first — they list what the last merge decided.
 
+**Gap:** the v2026.9.24 merge (`5c551e0d21`, 2026-09-30) left no conflict map, handoff or
+playbook update; the newest records are for v2026.9.14. Every merge writes both (§7).
+
 ## 0. Hard rules
 
 - **The live gateway shares this box.** Its liveness watchdog (`gateway.shutdown_watchdog`)
@@ -24,13 +27,20 @@ every command was run as written. Read the latest `docs/handoffs/HANDOFF_*upstre
 ```bash
 cd ~/.hermes/hermes-agent
 git fetch upstream --tags
-git tag --sort=-creatordate | head -3          # newest RELEASE TAG is the target, not upstream/main
-T=v2026.9.14                                    # example
+git tag -l --sort=-creatordate | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -3   # newest RELEASE TAG is the target, not upstream/main
+T=v0.22.2                                       # example
 git merge-base --is-ancestor $T upstream/main && echo tag-on-main
 git rev-parse --short HEAD                      # ROLLBACK POINT — write it down
 git rev-parse --is-shallow-repository           # must print false; if true see §2
 git merge-base main $T || echo EMPTY            # must print the previous upstream side; if EMPTY see §2
 ```
+
+Tag scheme (changed 2026-10): upstream moved from CalVer `v2026.M.D` (last: `v2026.9.24`) to
+semver `vX.Y.Z` (`v0.22.1` 2026-10-14, `v0.22.2` 2026-10-15; `v0.22.2` contains `v2026.9.24`).
+It also tags a nightly `vX.Y.Z+canary.<timestamp>` plus `rc.N-vX.Y.Z` and `abandoned-rc.N-vX.Y.Z`,
+so an unfiltered `--sort=-creatordate` lists only canaries. Never target a canary or rc; the filter
+above keeps plain `vX.Y.Z` by date. Don't sort by version (`-v:refname`): it ranks the old
+`v2026.9.24` above `v0.22.2`.
 
 ## 2. Keeping the clone un-shallow (fixed 2026-09-21)
 
