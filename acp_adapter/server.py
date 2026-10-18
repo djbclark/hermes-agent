@@ -211,6 +211,55 @@ def _take_interrupted_prompt(state: SessionState) -> tuple[bool, str]:
         return True, text
 
 
+def named_custom_slug_for_endpoint(base_url: str, *, prefer: str = "") -> str | None:
+    """Config key of the named provider serving ``base_url``, or None.
+
+    Named-custom resolution stores ``provider=custom``. ACP then advertises
+    ``custom:<model>``, and applying that id hits the bare-``custom`` self-heal
+    (``resolve_custom_provider``) and lands on the first custom provider.
+    Recover the named key from the live endpoint instead.
+
+    Several providers can share a host. Prefer ``model.provider`` when it is
+    one of the matches; otherwise return the key only when exactly one matches.
+    """
+    from urllib.parse import urlparse
+
+    from hermes_cli.config import load_config
+    from hermes_cli.config_providers import get_compatible_custom_providers
+
+    def _host(url: str) -> str:
+        raw = (url or "").strip()
+        if not raw:
+            return ""
+        parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+        return (parsed.netloc or "").lower()
+
+    host = _host(base_url)
+    if not host:
+        return None
+    cfg = load_config()
+    wanted = (prefer or str((cfg.get("model") or {}).get("provider") or "")).strip().lower()
+    if wanted.startswith("custom:"):
+        wanted = wanted.split(":", 1)[1]
+    matches: list[str] = []
+    for entry in get_compatible_custom_providers(cfg) or []:
+        if not isinstance(entry, dict):
+            continue
+        entry_host = _host(entry.get("api") or entry.get("url") or entry.get("base_url") or "")
+        if not entry_host or entry_host != host:
+            continue
+        key = str(entry.get("provider_key") or entry.get("name") or "").strip().lower().replace(" ", "-")
+        if key.startswith("custom:"):
+            key = key.split(":", 1)[1]
+        if key and key not in matches:
+            matches.append(key)
+    if wanted and wanted in matches:
+        return wanted
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
 class ModelRejected(ValueError):
     """``switch_model`` refused the requested model (no provider can serve it)."""
 
@@ -300,8 +349,16 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         as ``hermes model``/TUI/dashboard) so the selector isn't just the current curated list."""
         model = str(state.model or getattr(state.agent, "model", "") or "").strip()
         provider = getattr(state.agent, "provider", None) or detect_provider() or "openrouter"
+        base_url = str(getattr(state.agent, "base_url", "") or "")
+        # Bare ``custom`` plus a live endpoint is a named provider that lost its
+        # slug. Advertising ``custom:<model>`` makes the client echo an id that
+        # the bare-custom self-heal routes to the first custom provider.
+        if str(provider).strip().lower() == "custom" and base_url:
+            recovered = named_custom_slug_for_endpoint(base_url)
+            if recovered:
+                provider = recovered
         try:
-            picker = build_model_state(model, provider, str(getattr(state.agent, "base_url", "") or ""))
+            picker = build_model_state(model, provider, base_url)
             if picker is not None:
                 return picker
         except Exception:
@@ -329,6 +386,23 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         current_provider = getattr(state.agent, "provider", None)
         explicit_provider, model_input = parse_model_input(raw_model, "")
         cfg = load_config()
+        # ``custom:cline2`` is a catalog id, not a switch_model provider name.
+        # Bare ``custom`` is the self-heal that lands on the first custom provider.
+        provider_keys = {
+            str(key).strip().lower()
+            for key in (cfg.get("providers") or {})
+            if str(key).strip()
+        }
+        raw_provider = str(explicit_provider or "").strip()
+        if raw_provider.lower() == "custom":
+            recovered = named_custom_slug_for_endpoint(
+                str(getattr(state.agent, "base_url", "") or ""))
+            if recovered:
+                explicit_provider = recovered
+        elif raw_provider.lower().startswith("custom:"):
+            slug = raw_provider.split(":", 1)[1].strip().lower()
+            if slug in provider_keys:
+                explicit_provider = slug
         result = switch_model(
             raw_input=model_input, explicit_provider=explicit_provider,
             current_provider=current_provider or "openrouter", current_model=str(state.model or ""),
