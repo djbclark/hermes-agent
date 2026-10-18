@@ -1384,7 +1384,7 @@ class TestForeignLaunchdGateway:
 
         assert calls == [("term", 4242), ("kickstart", "com.example.gw", "gui/501")]
 
-    @pytest.mark.macos_only
+    @pytest.mark.platforms("macos")
     def test_gateway_restart_uses_foreign_launchd_job_instead_of_foreground(self, tmp_path, monkeypatch):
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "ai.hermes.gateway.plist")
         monkeypatch.setattr(gateway_cli, "_find_foreign_launchd_gateway", lambda: ("com.example.gw", "gui/501", 4242))
@@ -1401,7 +1401,7 @@ class TestForeignLaunchdGateway:
         assert restart_calls == [("com.example.gw", "gui/501", 4242)]
         assert run_calls == []
 
-    @pytest.mark.macos_only
+    @pytest.mark.platforms("macos")
     def test_gateway_restart_exits_when_foreign_launchd_restart_fails(self, tmp_path, monkeypatch):
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "ai.hermes.gateway.plist")
         monkeypatch.setattr(gateway_cli, "_find_foreign_launchd_gateway", lambda: ("com.example.gw", "gui/501", 4242))
@@ -1480,7 +1480,7 @@ class TestForeignLaunchdGatewayStopStart:
 
         assert calls == []
 
-    @pytest.mark.macos_only
+    @pytest.mark.platforms("macos")
     def test_gateway_stop_uses_foreign_job_not_pid_kill(self, tmp_path, monkeypatch):
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "ai.hermes.gateway.plist")
         monkeypatch.setattr(gateway_cli, "_find_foreign_launchd_gateway", lambda: ("com.example.gw", "gui/501", 4242))
@@ -1492,7 +1492,7 @@ class TestForeignLaunchdGatewayStopStart:
 
         assert calls == [("stop", "com.example.gw")]
 
-    @pytest.mark.macos_only
+    @pytest.mark.platforms("macos")
     def test_gateway_start_loads_foreign_plist_instead_of_regenerating_own(self, tmp_path, monkeypatch):
         plist = tmp_path / "com.example.gw.plist"
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "ai.hermes.gateway.plist")
@@ -1505,7 +1505,7 @@ class TestForeignLaunchdGatewayStopStart:
 
         assert calls == [("start", "com.example.gw", plist)]
 
-    @pytest.mark.macos_only
+    @pytest.mark.platforms("macos")
     def test_gateway_restart_starts_booted_out_foreign_job(self, tmp_path, monkeypatch):
         plist = tmp_path / "com.example.gw.plist"
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "ai.hermes.gateway.plist")
@@ -1521,7 +1521,7 @@ class TestForeignLaunchdGatewayStopStart:
         assert calls == [("start", "com.example.gw")]
 
 
-    @pytest.mark.macos_only
+    @pytest.mark.platforms("macos")
     def test_gateway_restart_all_reloads_foreign_job_instead_of_foreground(self, tmp_path, monkeypatch):
         plist = tmp_path / "com.example.gw.plist"
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "ai.hermes.gateway.plist")
@@ -1549,7 +1549,7 @@ class TestForeignLaunchdGatewayStopStart:
         captured = capsys.readouterr()
         assert "com.example.gw" in captured.out + captured.err
 
-    @pytest.mark.macos_only
+    @pytest.mark.platforms("macos")
     def test_get_service_pids_includes_foreign_job_pid(self, tmp_path, monkeypatch):
         monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "ai.hermes.gateway.plist")
