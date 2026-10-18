@@ -1,0 +1,76 @@
+name: Pytest on any ref
+
+# Forgejo-only (ha/base): run hermes-agent's unit suite (scripts/run_tests.sh /
+# run_tests_parallel.py) on any branch or commit pushed to this repository,
+# including refs that carry no .forgejo/ directory. Dispatch from the Actions
+# page or with scripts/forgejo-test-ref. Optional second ref runs as a parallel
+# job (a merge compares the merged tree with the pristine one).
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit SHA to check out (must be pushed to this repository)"
+        required: true
+        type: string
+      ref2:
+        description: "Optional second ref to test in parallel (leave empty for a single job)"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  test-a:
+    name: test ${{ inputs.ref }}
+    runs-on: ubuntu
+    timeout-minutes: 90
+    steps:
+      - name: Checkout the workflow's own branch
+        uses: https://github.com/actions/checkout@v4
+
+      - name: Checkout ${{ inputs.ref }}
+        uses: https://github.com/actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          path: target
+
+      - name: Workspace and uv cache on an ext4 loop image
+        run: bash .forgejo/scripts/fast-disk.sh
+
+      - name: Setup and run unit tests
+        timeout-minutes: 75
+        env:
+          HERMES_TEST_WORKERS: "16"
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+          TARGET_REF: ${{ inputs.ref }}
+        run: bash .forgejo/scripts/run-unit-tests.sh
+
+  test-b:
+    name: test ${{ inputs.ref2 }}
+    if: ${{ inputs.ref2 != '' }}
+    runs-on: ubuntu
+    timeout-minutes: 90
+    steps:
+      - name: Checkout the workflow's own branch
+        uses: https://github.com/actions/checkout@v4
+
+      - name: Checkout ${{ inputs.ref2 }}
+        uses: https://github.com/actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref2 }}
+          path: target
+
+      - name: Workspace and uv cache on an ext4 loop image
+        run: bash .forgejo/scripts/fast-disk.sh
+
+      - name: Setup and run unit tests
+        timeout-minutes: 75
+        env:
+          HERMES_TEST_WORKERS: "16"
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+          TARGET_REF: ${{ inputs.ref2 }}
+        run: bash .forgejo/scripts/run-unit-tests.sh

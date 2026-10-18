@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# forgejo-test-ref — push a ref to forgejo.mit.edu, dispatch Hyades pytest, wait, print summary.
+#
+#   scripts/forgejo-test-ref [--no-wait] REF [REF2]
+#   scripts/forgejo-test-ref main
+#   scripts/forgejo-test-ref merge-branch main
+#
+# Lives on the Forgejo-only ha/base branch (not on PATH). A local branch REF is
+# pushed to the `forgejo` remote first (fast-forward only, never forced); any
+# other REF must already be there. Dispatches .forgejo/workflows/ha-test-ref.yml
+# from ha/base. Optional REF2 starts a second parallel job. Exit 0 = success.
+# Start at most about 4 runs at once (shared Hyades runner capacity).
+set -euo pipefail
+
+repo=djbclark/hermes-agent
+workflow_ref=ha/base
+scripts="${FORGEJO_SCRIPTS:-$HOME/src/djbclark-ade/skills/forgejo/scripts}"
+api="$scripts/forgejo-api"
+var=DJBCLARK_FORGEJO_MIT_EDU_TOKEN
+
+if [ $# -lt 1 ] || { [ "$1" = "--no-wait" ] && [ $# -lt 2 ]; }; then
+  gsed -n '2,14p' "$0" >&2
+  exit 2
+fi
+
+if [ -z "${!var:-}" ] && [ -z "${HA_CI_REEXEC:-}" ]; then
+  HA_CI_REEXEC=1 exec sudo-secretspec run --reason "dispatch hermes-agent Hyades pytest" -- "$0" "$@"
+fi
+
+wait=1
+if [ "$1" = "--no-wait" ]; then
+  wait=0
+  shift
+fi
+ref=$1
+ref2=${2:-}
+top=$(git rev-parse --show-toplevel)
+
+push_if_local() {
+  local r=$1
+  if git -C "$top" show-ref --verify --quiet "refs/heads/$r"; then
+    "$scripts/git-forgejo" -C "$top" push forgejo "$r"
+  fi
+}
+push_if_local "$ref"
+[ -n "$ref2" ] && push_if_local "$ref2"
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+if [ -n "$ref2" ]; then
+  jq -n --arg ref "$ref" --arg ref2 "$ref2" --arg wref "$workflow_ref" \
+    '{ref: $wref, return_run_info: true, inputs: {ref: $ref, ref2: $ref2}}' > "$work/dispatch.json"
+else
+  jq -n --arg ref "$ref" --arg wref "$workflow_ref" \
+    '{ref: $wref, return_run_info: true, inputs: {ref: $ref, ref2: ""}}' > "$work/dispatch.json"
+fi
+[ -s "$work/dispatch.json" ]
+"$api" POST "/repos/$repo/actions/workflows/ha-test-ref.yml/dispatches" \
+  --data "@$work/dispatch.json" --yes > "$work/run.json"
+run_id=$(jq -r .id "$work/run.json")
+run_number=$(jq -r .run_number "$work/run.json")
+url="https://forgejo.mit.edu/$repo/actions/runs/$run_number"
+echo "dispatched run $run_number for $ref${ref2:+ + $ref2}"
+echo "$url"
+[ "$wait" = 1 ] || exit 0
+
+deadline=$(( $(date +%s) + ${HA_CI_WAIT:-7200} ))
+fails=0
+while :; do
+  if "$api" GET "/repos/$repo/actions/runs/$run_id" > "$work/status.json" &&
+     status=$(jq -re .status "$work/status.json"); then
+    fails=0
+  else
+    fails=$((fails + 1))
+    echo "forgejo-test-ref: poll $fails failed for run $run_number; retrying" >&2
+    if [ "$fails" -ge 10 ]; then
+      echo "forgejo-test-ref: 10 polls in a row failed; the run may still be going: $url" >&2
+      exit 1
+    fi
+    status=unknown
+  fi
+  case "$status" in
+    waiting|running|blocked|unknown) ;;
+    *) break ;;
+  esac
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "forgejo-test-ref: run $run_number still $status after ${HA_CI_WAIT:-7200} s: $url" >&2
+    exit 1
+  fi
+  sleep 30
+done
+
+logdir="$HOME/.local/state/hermes-forgejo-ci"
+mkdir -p "$logdir"
+"$api" GET "/repos/$repo/actions/runs/$run_id/jobs" > "$work/jobs.json"
+job_count=$(jq -r 'if type=="array" then length else (.jobs|length) end' "$work/jobs.json")
+echo "jobs: $job_count  status: $status"
+i=0
+while [ "$i" -lt "$job_count" ]; do
+  job_id=$(jq -re --argjson i "$i" 'if type=="array" then .[$i].id else .jobs[$i].id end' "$work/jobs.json")
+  job_name=$(jq -re --argjson i "$i" 'if type=="array" then .[$i].name else .jobs[$i].name end' "$work/jobs.json")
+  job_status=$(jq -re --argjson i "$i" 'if type=="array" then .[$i].status else .jobs[$i].status end' "$work/jobs.json")
+  log="$logdir/run-$run_number-job-$i.log"
+  if "$api" GET "/repos/$repo/actions/jobs/$job_id/logs" > "$log"; then
+    echo "---- $job_name ($job_status) log $log ----"
+    # Summary lines from run_tests_parallel.py / pytest
+    ggrep -E '^(FAILED|ERROR|passed|failed|error|=====|-----|files?:|tests? |BENCHSTEP|passed in |FAILED |ERROR )' "$log" \
+      | tail -n 80 || true
+    # Explicit FAILED/ERROR test ids (pytest node ids)
+    echo "-- FAILED/ERROR node ids --"
+    ggrep -E '^(FAILED|ERROR) ' "$log" | tail -n 100 || true
+    # Pass/fail counts if present
+    ggrep -E '[0-9]+ passed|[0-9]+ failed|[0-9]+ error|files passed|files failed' "$log" | tail -n 20 || true
+  else
+    echo "---- $job_name ($job_status): log not fetched ----"
+  fi
+  i=$((i + 1))
+done
+echo "run $run_number: $status ($url)"
+[ "$status" = success ]
