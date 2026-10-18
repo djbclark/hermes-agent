@@ -159,7 +159,8 @@ def _validate_single_op(store, action, target, content, old_text) -> Optional[st
             "error": (f"'{action}' needs old_text -- a short unique substring of the entry "
                       f"to {action}. None was provided. Reissue the {action} with old_text "
                       f"set to part of one of the current_entries below."),
-            "current_entries": store.entries_for_read(target),  # FORK(memory-capacity-guard): show queued writes too
+            # FORK(memory-capacity-guard): show queued writes too; a plain MemoryStore has no journal view
+            "current_entries": getattr(store, "entries_for_read", store._entries_for)(target),
             "usage": store._usage(target)}, ensure_ascii=False)
     if action == "patch" and not content:
         FAILURE_CLASS.set("missing_content")

@@ -15,6 +15,12 @@
     "kind": "bare_which"
   },
   {
+    "path": "agent/lsp/cli.py",
+    "symbol": "_resolved_binary",
+    "kind": "bare_which",
+    "reason": "FORK(lsp-brew): user-installed language-server binaries (brew/npm globals) resolved from PATH, as _backend_warnings does"
+  },
+  {
     "path": "agent/lsp/install.py",
     "symbol": "_do_install",
     "kind": "bare_which"
@@ -667,6 +673,12 @@
     "path": "agent/anthropic_adapter.py",
     "symbol": "<module>",
     "kind": "known_path_table"
+  },
+  {
+    "path": "hermes_cli/aiuse_command.py",
+    "symbol": "run_aiuse_for_chat",
+    "kind": "bare_which",
+    "reason": "FORK(aiuse): the operator's own aiuse CLI on PATH; not a managed runtime command"
   },
   {
     "path": "tools/bot_desktop/browser.py",

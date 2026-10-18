@@ -1634,7 +1634,10 @@ class TestHTTPConfig:
         config = {"url": "https://example.com/mcp"}
 
         async def _test():
-            with patch("tools.mcp_tool._MCP_HTTP_AVAILABLE", False):
+            # FORK(mcp-http-detect): _run_http re-probes the SDK before giving up, so the
+            # probe must fail too or the test makes a real request to example.com.
+            with patch("tools.mcp_tool._MCP_HTTP_AVAILABLE", False), \
+                    patch("tools.mcp_tool._import_sdk_names", return_value=False):
                 with pytest.raises(ImportError):
                     await server._run_http(config)
 
