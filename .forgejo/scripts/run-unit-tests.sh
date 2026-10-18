@@ -5,10 +5,18 @@
 set -euo pipefail
 cd "$PWD"
 # Ensure pytest tmp_path / Hermes DBs are not on virtiofs (WAL refusal).
-if [ -d /mnt/fast/tmp ]; then
+# run_tests_parallel.py and conftest hardcode /var/tmp/hermes-pytest when
+# /var/tmp exists, so TMPDIR alone is not enough — bind it onto the loop.
+if [ -d /mnt/fast ]; then
+  mkdir -p /mnt/fast/tmp /mnt/fast/vartmp /mnt/fast/home/.hermes
+  if ! findmnt -n /var/tmp 2>/dev/null | grep -q /mnt/fast; then
+    echo "BENCHSTEP vartmp-bind"
+    mount --bind /mnt/fast/vartmp /var/tmp
+  fi
   export TMPDIR=/mnt/fast/tmp TMP=/mnt/fast/tmp TEMP=/mnt/fast/tmp
   export HERMES_HOME="${HERMES_HOME:-/mnt/fast/home/.hermes}"
   mkdir -p "$TMPDIR" "$HERMES_HOME"
+  df -hT /var/tmp /mnt/fast/tmp
 fi
 # Run 9 died with EMFILE (Error 24) near the end: 508 files never collected and
 # post-job git failed loading libc. Raise the soft nofile ceiling for this job.

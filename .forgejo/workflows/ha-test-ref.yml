@@ -40,7 +40,7 @@ jobs:
       - name: Setup and run unit tests
         timeout-minutes: 75
         env:
-          HERMES_TEST_WORKERS: "16"
+          HERMES_TEST_WORKERS: "8"
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
@@ -68,7 +68,7 @@ jobs:
       - name: Setup and run unit tests
         timeout-minutes: 75
         env:
-          HERMES_TEST_WORKERS: "16"
+          HERMES_TEST_WORKERS: "8"
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
