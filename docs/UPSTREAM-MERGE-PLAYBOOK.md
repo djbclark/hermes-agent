@@ -221,10 +221,13 @@ rm -rf "$Q/.venv" "$Q/venv"; git -C "$Q" checkout -q --detach $T; ln -s "$P/.ven
 # timing, xdist sys.modules pollution such as a leaked `telegram` MagicMock). Fork-only parametrizations
 # (`[opencode-free]`) do not exist on pristine and pytest aborts the whole run on one unknown id: intersect
 # the id list with `pytest --collect-only -q <files>` on the pristine tree first.
-# Alternative for gate (c), used 2026-10-18 when the Mac was starved: Hyades CI on forgejo.mit.edu
-# (`scripts/forgejo-test-ref <merged-ref> <pristine-ref>` on the Forgejo-only `ha/base` branch; upstream's
-# per-file runner, merged and pristine as two parallel jobs). Run 16 hit the 75-min job deadline at ~94 %
-# (alphabetically up to tests/tools/test_x*), so run the tail of tests/tools locally.
+# Gate (c) on CI instead of this Mac (preferred since 2026-10-18): free GitHub runners, branch `ci/base` on
+# github.com/djbclark/hermes-agent (docs/github-ci-test-ref.md there). From any fork checkout:
+#   git fetch origin ci/base && git checkout origin/ci/base -- scripts/github-test-ref
+#   scripts/github-test-ref <merged-ref> <pristine-ref>     # 10 shards, ~9 min; pushes only ci/run/**
+# CI under load flakes: on 2026-10-18 8 of 9 merged-only ids passed serially; re-run merged-only ids
+# serially on both trees (`-p no:xdist`) before calling them merge-caused. (The earlier Hyades/Forgejo
+# route, scripts/forgejo-test-ref on ha/base, is retired; that repo was deleted.)
 # gate (d): NEVER against the live ~/.hermes. A v0.22.2 launch migrates config.yaml (34 -> 50, writes a .bak),
 # creates installs/, and bumps state.db (30 -> 31) forward-only. Use a throwaway home:
 H=$(mktemp -d); cp ~/.hermes/config.yaml "$H/"; ln -s ~/.hermes/.env "$H/.env"
