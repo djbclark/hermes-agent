@@ -14,7 +14,7 @@ truncate -s 40G "$img"
 mkfs.ext4 -q -F -E lazy_itable_init=1,lazy_journal_init=1 "$img"
 mkdir -p "$fast"
 mount -o loop,noatime "$img" "$fast"
-mkdir -p "$fast/ws" "$fast/uv-cache" "$fast/cache"
+mkdir -p "$fast/ws" "$fast/uv-cache" "$fast/cache" "$fast/tmp" "$fast/home"
 cp -a "$GITHUB_WORKSPACE/." "$fast/ws/"
 # Hyades runs every step in the job's initial cwd (SIPB's crun krun exec ignores the step's working
 # directory, and with it `working-directory:`), which is now the directory under this mount. Java,
@@ -23,4 +23,12 @@ cp -a "$GITHUB_WORKSPACE/." "$fast/ws/"
 mount --bind "$fast/ws" "$GITHUB_WORKSPACE"
 echo "UV_CACHE_DIR=$fast/uv-cache" >> "$GITHUB_ENV"
 echo "XDG_CACHE_HOME=$fast/cache" >> "$GITHUB_ENV"
+# Hermes refuses WAL on virtiofs/9p (hermes_state_wal._path_on_cross_vm_fs). Pytest's tmp_path
+# and Hermes home must live on this ext4 loop, not the guest's virtiofs /tmp or /root.
+echo "TMPDIR=$fast/tmp" >> "$GITHUB_ENV"
+echo "TMP=$fast/tmp" >> "$GITHUB_ENV"
+echo "TEMP=$fast/tmp" >> "$GITHUB_ENV"
+# Do not rewrite HOME (breaks uv's ~/.local/bin). Hermes state/tests use HERMES_HOME + TMPDIR.
+echo "HERMES_HOME=$fast/home/.hermes" >> "$GITHUB_ENV"
+mkdir -p "$fast/home/.hermes"
 df -hT "$GITHUB_WORKSPACE" "$fast"

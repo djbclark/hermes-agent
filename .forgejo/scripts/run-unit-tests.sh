@@ -4,6 +4,12 @@
 # env HERMES_TEST_WORKERS, TARGET_REF. Must start with cd "$PWD" (Hyades cwd quirk).
 set -euo pipefail
 cd "$PWD"
+# Ensure pytest tmp_path / Hermes DBs are not on virtiofs (WAL refusal).
+if [ -d /mnt/fast/tmp ]; then
+  export TMPDIR=/mnt/fast/tmp TMP=/mnt/fast/tmp TEMP=/mnt/fast/tmp
+  export HERMES_HOME="${HERMES_HOME:-/mnt/fast/home/.hermes}"
+  mkdir -p "$TMPDIR" "$HERMES_HOME"
+fi
 echo "BENCHSTEP start setup ref=${TARGET_REF:-unknown}"
 echo "ref ${TARGET_REF:-} is $(git -C target rev-parse HEAD)"
 git -C target log -1 --format='%h %s'
