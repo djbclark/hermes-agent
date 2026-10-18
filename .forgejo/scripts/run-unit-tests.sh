@@ -11,6 +11,14 @@ nproc
 free -h | head -2
 df -hT "$GITHUB_WORKSPACE" /mnt/fast 2>/dev/null || true
 
+# libkrun TSI: listeners on 127.0.0.1:0 and cross-thread socket ops hang/refuse
+# without the loopback port shim (SIPB/hyades#3, libkrun#818/#819).
+echo "BENCHSTEP portshim"
+command -v gcc >/dev/null || { apt-get update -qq && apt-get install -y -qq gcc libc6-dev; }
+gcc -shared -fPIC -O2 -pthread -o /usr/local/lib/portshim.so \
+  "$GITHUB_WORKSPACE/.forgejo/scripts/loopback-port-shim.c" -ldl
+echo /usr/local/lib/portshim.so >> /etc/ld.so.preload
+
 # ripgrep (some hermes tests shell out to rg)
 RG_VERSION=15.1.0
 RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
