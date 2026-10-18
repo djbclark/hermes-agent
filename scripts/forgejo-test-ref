@@ -38,9 +38,16 @@ top=$(git rev-parse --show-toplevel)
 
 push_if_local() {
   local r=$1
-  if git -C "$top" show-ref --verify --quiet "refs/heads/$r"; then
-    "$scripts/git-forgejo" -C "$top" push forgejo "$r"
+  if ! git -C "$top" show-ref --verify --quiet "refs/heads/$r"; then
+    return 0
   fi
+  # Fast-forward only. If the Forgejo tip already has this name (e.g. orphan
+  # mirror of GitHub main, or another agent's push), keep going: dispatch
+  # checks out whatever is on the Forgejo remotes for that ref.
+  if "$scripts/git-forgejo" -C "$top" push forgejo "$r"; then
+    return 0
+  fi
+  echo "forgejo-test-ref: local $r did not fast-forward to forgejo; using remote tip" >&2
 }
 push_if_local "$ref"
 [ -n "$ref2" ] && push_if_local "$ref2"
