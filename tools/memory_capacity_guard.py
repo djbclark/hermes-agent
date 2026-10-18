@@ -560,10 +560,11 @@ class GuardedMemoryStore(_UpstreamMemoryStore):
             ops = [op or {} for op in payload["operations"]]
         for i, op in enumerate(ops):
             act = op.get("action")
-            # Upstream returns (error, previous_content); only the error means "invalid op".
-            error, _previous = self._apply_batch_op(
+            # Upstream returns a tuple led by the error (v2026.9.24: (error, previous); v0.22.2:
+            # (error, previous, failure_class, patched_entry)); only the error means "invalid op".
+            error = self._apply_batch_op(
                 working, act, (op.get("content") or op.get("new_text") or "").strip(),
-                (op.get("old_text") or "").strip(), f"Operation {i + 1}")
+                (op.get("old_text") or "").strip(), f"Operation {i + 1}")[0]
             if error:
                 return False
         return bool(working) and len(ENTRY_DELIMITER.join(working)) > limit
