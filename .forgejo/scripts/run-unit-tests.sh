@@ -49,18 +49,28 @@ mv "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
 rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
 rg --version
 
-# uv 0.12.13 pinned to match GitHub tests.yml (CPython 3.11.16 / SQLite 3.53.1)
+# uv 0.12.13 pinned to match GitHub tests.yml (CPython 3.11.16 or 3.14 / SQLite 3.53.1)
 curl -LsSf https://astral.sh/uv/0.12.13/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 uv --version
 
 cd "$GITHUB_WORKSPACE/target"
-echo "BENCHSTEP uv python install"
-uv python install 3.11
-echo "BENCHSTEP uv sync"
-uv sync --locked --python 3.11 \
-  --extra all --extra dev --extra anthropic --extra mistral \
-  --extra fal --extra modal --extra daytona --extra parallel-web --extra bedrock
+# Upstream v0.22+ moved `dev` from an extra to [dependency-groups] and pins Python 3.14
+# (tests.yml: uv sync --locked --python 3.14 --extra all --group dev ...); older trees use the
+# 3.11 extra layout. Pick by the tree under test. Only extras the tree defines are passed.
+if grep -q '^\[dependency-groups\]' pyproject.toml; then
+  py=3.14; dev=(--group dev)
+else
+  py=3.11; dev=(--extra dev)
+fi
+extras=()
+for e in all anthropic mistral fal modal daytona parallel-web bedrock; do
+  grep -qE "^${e} = \[" pyproject.toml && extras+=(--extra "$e")
+done
+echo "BENCHSTEP uv python install $py"
+uv python install "$py"
+echo "BENCHSTEP uv sync (python $py, ${dev[*]}, ${#extras[@]} extras)"
+uv sync --locked --python "$py" "${extras[@]}" "${dev[@]}"
 uv cache prune --ci
 
 echo "BENCHSTEP sqlite wal check"
