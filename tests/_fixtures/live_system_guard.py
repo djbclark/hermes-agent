@@ -230,6 +230,26 @@ def _live_system_guard(request, monkeypatch):
             tokens = cmd_str.split()
         return any(verb in tokens for verb in _MUTATING_VERBS)
 
+    # FORK(launchctl-guard): the fork drives an operator-managed launchd job
+    # (com.stayturgid.hermes-gateway) with real ``launchctl`` verbs
+    # (hermes_cli/gateway.py _stop/_start/_restart_foreign_launchd_gateway). Upstream's
+    # guard only covers systemctl, so a test that leaks into that path on the operator's
+    # Mac would boot the LIVE gateway out. Refuse mutating launchctl verbs on hermes labels.
+    _LAUNCHCTL_MUTATING_VERBS = (
+        "bootout", "bootstrap", "kickstart", "kill", "stop", "start", "load", "unload",
+        "remove", "enable", "disable", "submit",
+    )
+
+    def _is_blocked_launchctl(cmd) -> bool:
+        cmd_str = _cmd_to_string(cmd)
+        if "launchctl" not in cmd_str or "hermes" not in cmd_str.lower():
+            return False
+        try:
+            tokens = _shlex.split(cmd_str)
+        except ValueError:
+            tokens = cmd_str.split()
+        return any(verb in tokens for verb in _LAUNCHCTL_MUTATING_VERBS)
+
     def _is_process_killer(cmd) -> bool:
         cmd_str = _cmd_to_string(cmd)
         try:
@@ -281,6 +301,14 @@ def _live_system_guard(request, monkeypatch):
                 "live hermes-gateway systemd unit. Mock "
                 "subprocess.run / _run_systemctl in the test, or "
                 "mark with @pytest.mark.live_system_guard_bypass."
+            )
+        if _is_blocked_launchctl(cmd):  # FORK(launchctl-guard)
+            raise RuntimeError(
+                f"tests/conftest.py live-system guard: blocked "
+                f"subprocess.{name}({cmd!r}) — would mutate a live hermes "
+                "launchd job (the operator's gateway). Mock subprocess.run / the "
+                "_*_foreign_launchd_gateway helpers, or mark with "
+                "@pytest.mark.live_system_guard_bypass."
             )
         if _is_process_killer(cmd):
             raise RuntimeError(
