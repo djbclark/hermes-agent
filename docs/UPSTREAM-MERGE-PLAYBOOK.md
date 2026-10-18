@@ -1,11 +1,16 @@
 # Upstream merge playbook (fork djbclark/hermes-agent ← NousResearch/hermes-agent)
 
-Distilled from the 2026-08-22 (v2026.8.19) and 2026-09-21 (v2026.9.14) merges. Copy-pasteable;
-every command was run as written. Read the latest `docs/handoffs/HANDOFF_*upstream-merge*` and
-`docs/UPSTREAM_MERGE_CONFLICT_MAP_*.md` first — they list what the last merge decided.
+Distilled from the 2026-08-22 (v2026.8.19), 2026-09-21 (v2026.9.14) and 2026-10-18 (v0.22.2)
+merges. Copy-pasteable; every command was run as written unless marked UNVERIFIED. Read the latest
+`docs/handoffs/HANDOFF_*upstream-merge*` and `docs/UPSTREAM_MERGE_CONFLICT_MAP_*.md` first — they
+list what the last merge decided.
 
-**Gap:** the v2026.9.24 merge (`5c551e0d21`, 2026-09-30) left no conflict map, handoff or
-playbook update; the newest records are for v2026.9.14. Every merge writes both (§7).
+The v2026.9.24 merge (`5c551e0d21`, 2026-09-30) left no record of its own; the v0.22.2 conflict map
+reconstructs what it decided. Every merge writes both a conflict map and a handoff (§7).
+
+**v0.22.2 changed promotion fundamentally (§6):** upstream's new `pm/` package owns the runtime
+environment (Python 3.14 store interpreter, venv under `$HERMES_HOME/installs/`), so the old
+`uv pip install -e '.[all]' --python venv/bin/python` step no longer works.
 
 ## 0. Hard rules
 
@@ -20,7 +25,15 @@ playbook update; the newest records are for v2026.9.14. Every merge writes both 
   (a second KeepAlive job would fight `com.stayturgid.hermes-gateway`).
 - Never bare `git push` there: `main` tracks `upstream/main`. Always `git push origin main`.
 - Dependency pins: take upstream's `pyproject.toml`/`uv.lock`/`tools/lazy_deps.py`/
-  `package-lock.json`. Never bump beyond the merged lockfile (`tool.uv exclude-newer = "14 days"`).
+  `package-lock.json`. Never bump beyond the merged lockfile (`tool.uv exclude-newer`, "3 days" at
+  v0.22.2). Since v0.22.2 `pm/` owns the runtime environment: never raw `pip`/`uv pip` into it
+  (`pm/AGENTS.md`); a pasture's own `.venv` for tests is fine.
+- Tests can reach real `launchctl`: the fork's foreign-launchd helpers boot out / kickstart the
+  operator's `com.stayturgid.hermes-gateway`. Upstream's test live-system guard only blocks
+  `systemctl` and process killers; the fork adds `FORK(launchctl-guard)` in
+  `tests/_fixtures/live_system_guard.py`. Re-apply it if a merge drops it, BEFORE running any test.
+- The box is often memory-bound (16 GB, swapping) rather than CPU-bound; `uptime` alone
+  understates the risk. `~/ops/site-private/bin/bg` adds its own load gate and machine-wide test slots.
 
 ## 1. Pick the target and prepare the repo
 
@@ -76,13 +89,19 @@ pasture cannot touch the live venvs. The wrapper does not pass `--no-symlink`, s
 `cow`, then scrub secrets with the wrapper:
 
 ```bash
-YM=$(date +%Y-%m); W=~/orca/projects/djbclark-ade/bin/cow-pasture
+YM=$(date +%Y-%m); W=~/src/djbclark-ade/bin/cow-pasture
 P=$(cow create upstream-merge-$YM --source ~/.hermes/hermes-agent --branch chore/upstream-merge-$YM --no-symlink --print-path | tail -1)
+rm -rf "$P/.venv" "$P/venv"  # copied 3.11 venvs are useless (rebuilt in §5) and make scrub crawl
 $W scrub "$P"; cd "$P"      # removes gitignored secret-like files; add `$W trust "$P"` only for Claude Code sessions
 git rev-parse --is-shallow-repository                # false
 git diff --name-only $(git merge-base main $T) HEAD > /tmp/fork_delta.txt        # fork feature files
-git merge --no-commit --no-ff $T; git diff --name-only --diff-filter=U               # conflict list
+git -c merge.renameLimit=20000 merge --no-commit --no-ff $T; git diff --name-only --diff-filter=U   # conflict list
 ```
+
+Scrub cost (2026-10-18): `cow-pasture scrub` forks `basename` once per ignored file; with the
+copied `.venv`/`venv`/`node_modules` (~160k files) it ran >12 min, raised the load, and deleted
+`credentials.py`/`cacert.pem` inside the copied venvs (harmless only because they are rebuilt).
+Deleting the venvs first, as above, leaves only `node_modules`.
 
 Per conflicted file, decide in this order:
 1. **Does upstream now implement the fork feature?** Grep the tag for the *behaviour* (not our
@@ -95,6 +114,16 @@ Per conflicted file, decide in this order:
    `models_validate.py`, `tools/mcp_tool.py` → `mcp_tool_loop.py`, etc.). Anchor edits with
    asserted string replacements; fork-only logic goes into its own module when possible
    (e.g. `tools/mcp_tolerant_list.py`) so the next merge does not conflict.
+   v0.22.2 specifics: most conflicts were upstream's `Dict`/`List` → `dict`/`list` typing sweep
+   colliding with fork signature additions (take upstream's typing, keep the fork params);
+   `hermes_cli/gateway.py::_cmd_start` now runs inside `with start_scope:` (fork hook goes inside);
+   `agent/lsp` gained workspace trust (`UNTRUSTED_SAFE_SERVERS`, 3-arg `_client_key`, `_live_key`);
+   update code split into `update_cmd_check/commit/validation/...`, `update_completion`,
+   `venv_sync`, `source_completion`; `hermes_cli/update_cmd_deps.py` deleted. After resolving,
+   look for a fork function that upstream ALSO defines now (Python keeps the later definition
+   silently): v0.22.2 had two `_spawn_typescript`s. Run
+   `ruff check --isolated --select F821,F811,F823,F822` over the fork-touched `.py` files and diff
+   the findings against the same files at `$T`.
 3. `tools/memory_tool.py` and `tools/memory_tool_store.py` take **upstream's version verbatim
    except the tagged hooks**: `git checkout --theirs` (or `$T -- <file>`), then re-apply the
    `# FORK(memory-capacity-guard):` hooks (`grep -rn "FORK(memory-capacity-guard)" tools/`; there are
@@ -107,6 +136,10 @@ Per conflicted file, decide in this order:
    `tests/tools/test_memory_capacity_guard*.py`, `test_memory_projection.py`,
    `test_memory_pending_queue.py`, `test_memory_fault_path.py`, `test_write_approval.py`.
    Do NOT hand-port upstream memory fixes into the fork any more; they arrive natively.
+   Signature drift seen so far: v2026.9.24 `_apply_batch_op` → `(error, previous)`, `_edit` gained
+   `matched_entry`, `_success_response(**extra)`; v0.22.2 `_apply_batch_op` → 4-tuple
+   `(error, previous, failure_class, patched_entry)` (the guard now reads `[0]`) and a new
+   `patch` action (`MemoryStore.patch`/`_patch`, span edit) that the guard does NOT journal yet.
 4. Fork docs stay in `docs/` (upstream deleted it; git auto-moves them under `website/docs/`).
 5. Dep files: theirs. `apps/desktop/package.json` must match `package-lock.json`.
 
@@ -130,20 +163,42 @@ gateway/slash_commands_model.py; tools/memory_capacity_guard.py `apply_with_capa
 tools/write_approval.py `_pq.enqueue(`; agent/moa_loop.py `_record_reference_cooldown`;
 hermes_cli/models_validate.py `_validate_discovery_disabled`; runtime_provider_custom.py
 `"x-api-key"`; runtime_provider.py `allow_paid_opencode_zen`; model_cost_guard.py `is_free_model`;
-tools/file_tools.py `_find_truncation_placeholder(content)`; agent/context_compressor.py
-`_format_compression_marker`; `/clinepass` + `/aiuse` handlers (cli_commands_mixin,
+tools/file_tools.py `_find_truncation_placeholder(content)` and
+`_find_truncation_placeholder(_extract_v4a_added_content(patch))` (tools/truncation_markers.py);
+compressor marker: switched to upstream's `agent/compression_marker.py` at v2026.9.24 (the fork's
+`_format_compression_marker` is gone on purpose); `/clinepass` + `/aiuse` handlers (cli_commands_mixin,
 cli_info_mixin, slash_commands_model, slash_commands_status, commands.py, commands_platforms.py
-`"aiuse", "clinepass"`); agent/reasoning_params.py `"cline.bot"`; shutdown_forensics
-`ctx["supervisor"]`. `~/.hermes/scripts/check-gateway-fork-invariants.sh` greps most of these.
+`"aiuse", "clinepass"`, tui_gateway/methods_slash.py, desktop `AIUSE_SLASH_TIMEOUT_MS` +
+`timeoutMs: surface?.kind === 'exec'` in use-prompt-actions/slash.ts); agent/reasoning_params.py
+`"cline.bot"`; shutdown_forensics `ctx["supervisor"]`.
+Added 2026-10-18 (fork features since v2026.9.14): Telegram `_clarify_button_label` (choice text on
+clarify buttons); hermes_cli/web_server_config.py `_stringify_unsafe_ints`; acp_adapter/server.py
+named custom provider recovery (96e2e32104); tools/mcp_tool.py Streamable HTTP probe when
+`ClientSession` is pre-bound (044a39f35a; tests in test_startup_latency_regressions.py); keyless
+`opencode-free` (`FORK(opencode-zen-keyless)`: auth.py registry row + aliases, providers.py label,
+hermes_cli/opencode_zen_keyless.py, plugins/model-providers/opencode-free); agent/lsp
+`_PYRIGHT_BINS`, `_server("ruff"`/`"marksman"`/`"taplo"`, `_discover_tsserver_js`,
+`RUST_ANALYZER_WAIT_TIMEOUT`, manager `_matching_servers` (and ruff/marksman/taplo in
+`UNTRUSTED_SAFE_SERVERS`); tests/_fixtures/live_system_guard.py `FORK(launchctl-guard)`.
+Runnable version: `bash docs/fork-feature-checklist.sh <tree>` (prints MISSING lines, `missing=N`);
+extend it when a fork feature lands.
+`~/.hermes/scripts/check-gateway-fork-invariants.sh` greps most of these.
 
 ## 5. Verification gates (in order)
 
 ```bash
-uv sync --frozen --all-extras --no-extra matrix && uv pip install --python .venv/bin/python pytest-xdist pytest-timeout
-# (`uv sync` removes the two plugins, reinstall them every time; it clones from the uv cache, ~free.)
+uv sync --frozen --all-extras --no-extra matrix --group dev --group test && uv pip install --python .venv/bin/python pytest-xdist pytest-timeout
+# v0.22.2: `default-groups = []`, so without `--group dev` there is no pytest-asyncio and every async
+# test fails. `.python-version` = 3.14 (uv builds a 3.14 .venv). First sync after a big jump downloads
+# ~200 wheels (29 min on 2026-10-18); later ones clone from the uv cache.
+# (`uv sync` removes the two plugins, reinstall them every time.)
 .venv/bin/python -c "import importlib.metadata as m; print(m.version('mcp'))"   # must equal the pyproject pin (2.0.0)
 export HERMES_HOME=$(mktemp -d)                                           # never the live ~/.hermes
-P="nice -n 15 .venv/bin/python -m pytest -q -p no:cacheprovider --timeout 180 --timeout-method=thread"
+P="$HOME/ops/site-private/bin/bg nice -n 15 .venv/bin/python -m pytest -q -p no:cacheprovider --timeout 180 --timeout-method=thread"
+# A collection error inside an xdist worker shows up as an INTERNALERROR "assert not crashitem";
+# re-run that file with `-p no:xdist` to see the real error (2026-10-18: retired `macos_only` mark).
+# Upstream's own runner is scripts/run_tests.sh (one pytest subprocess per file); the chunked
+# pytest below + pristine comparison remains the fork's method.
 $P tests/hermes_cli/test_gateway_service.py                                          # gate (a)
 $P tests/hermes_cli/test_clinepass_command.py tests/gateway/test_clinepass_command.py \
    tests/hermes_cli/test_aiuse_command.py tests/hermes_cli/test_model_validation.py \
@@ -157,13 +212,33 @@ $P tests/hermes_cli/test_clinepass_command.py tests/gateway/test_clinepass_comma
 # gate (c): full suite, one chunk at a time (split tests/gateway, tests/hermes_cli, tests/agent+hermes_state,
 # tests/tools into halves, then the rest; ~2-20 min each at -n 4). Collect FAILED/ERROR ids, re-run them
 # isolated on the merged tree, then the SAME ids on a pristine worktree of the tag with the same venv:
-git -C ~/.hermes/hermes-agent worktree add --detach ~/.hermes/hermes-agent-worktrees/upstream-pristine-$T $T
+Q=$(cow create upstream-pristine-$T --source ~/.hermes/hermes-agent --branch pristine-$T --no-symlink --print-path | tail -1)
+rm -rf "$Q/.venv" "$Q/venv"; git -C "$Q" checkout -q --detach $T; ln -s "$P/.venv" "$Q/.venv"   # same venv; never a worktree of the live .git
 # ids with spaces/braces: tr '\n' '\0' < ids.txt | xargs -0 nice -n 15 .venv/bin/python -m pytest ...
 # Only ids that fail on merged but pass on pristine are merge-caused. Expect ~90 environmental
 # failures identical on both (web dashboard, update autostash/self-lock, voice, install.sh, /tmp path asserts).
-timeout 240 .venv/bin/python hermes -z "Reply with exactly: SMOKE-OK"                # gate (d), live config
-# gate (e): the §4 grep checklist; also slack_native_slashes() must be <= 50.
+# v0.22.2: ~350 environmental at -n 4 on a loaded Mac (also real-`gh` release scripts, termux, connector RPC
+# timing, xdist sys.modules pollution such as a leaked `telegram` MagicMock). Fork-only parametrizations
+# (`[opencode-free]`) do not exist on pristine and pytest aborts the whole run on one unknown id: intersect
+# the id list with `pytest --collect-only -q <files>` on the pristine tree first.
+# Alternative for gate (c), used 2026-10-18 when the Mac was starved: Hyades CI on forgejo.mit.edu
+# (`scripts/forgejo-test-ref <merged-ref> <pristine-ref>` on the Forgejo-only `ha/base` branch; upstream's
+# per-file runner, merged and pristine as two parallel jobs). Run 16 hit the 75-min job deadline at ~94 %
+# (alphabetically up to tests/tools/test_x*), so run the tail of tests/tools locally.
+# gate (d): NEVER against the live ~/.hermes. A v0.22.2 launch migrates config.yaml (34 -> 50, writes a .bak),
+# creates installs/, and bumps state.db (30 -> 31) forward-only. Use a throwaway home:
+H=$(mktemp -d); cp ~/.hermes/config.yaml "$H/"; ln -s ~/.hermes/.env "$H/.env"
+HERMES_HOME=$H HERMES_DISABLE_LAZY_INSTALLS=1 timeout 240 .venv/bin/python hermes -z "Reply with exactly: SMOKE-OK"; rm -rf "$H"
+# gate (e): bash docs/fork-feature-checklist.sh "$P"; also slack_native_slashes() must be <= 50 (50 at v0.22.2).
 ```
+
+Upstream tests that enumerate providers or stores catch fork additions; expect to adapt them (with a
+`FORK(...)` note) after each merge, as at v0.22.2: e2e catalog (`tests/e2e/core/providers/_catalog_helpers.py`
+`KEYLESS_PROVIDERS` + `allow_paid_opencode_zen` in `write_home`), `tests/fixtures/provider_wire_snapshot.json`
+(record a new fork provider with `HERMES_UPDATE_WIRE_SNAPSHOT=1` on just its cell),
+`tests/fixtures/resolution_allowlist.json` (fork `shutil.which` sites), provider catalog / desktop parity
+exemptions, the upstream "opencode-free was removed" test, and anything reading `pending/memory/*.json`
+(the fork keeps MEMORY approvals in `memory_pending.db`).
 
 Known quirk (upstream, reproduced on a pristine tag): if `test_memory_tool_import_fallback.py`
 runs before `test_memory_tool.py` in one process, 3 `TestMemoryFileLockPermissions` tests fail.
@@ -172,6 +247,21 @@ The live dev venv `~/.hermes/hermes-agent/.venv` was rebuilt with the command ab
 2026-09-21 (it had lagged at mcp 1.28.1 and lacked xdist/timeout), so it can also run the gates.
 
 ## 6. Promotion and rollback
+
+**OBSOLETE FROM v0.22.2 — do not run the block below as written.** It installs into the checkout's
+3.11 `venv/`; v0.22.2 gates every runtime dependency on `python_version >= '3.14'` and runs from a
+pm-managed environment (`$HERMES_HOME/installs/<sha16(checkout)>/environments/<uuid>/venv`, store
+Python 3.14 from `~/.hermes/tools`). `update_cmd_deps._refresh_active_lazy_features` is now a stub
+that calls `stop_for_relaunch()`. Also new: the first launch publishes `<checkout>/.hermes/bin/hermes`
+and rewrites `~/.local/bin/hermes` (the shim both `com.stayturgid.hermes-gateway` and
+`com.djbclark.hermes-dashboard` exec) unless `cli.expose_on_path: false`; state DB schema 30 → 31
+and config version → 50 migrate forward-only. `git reset` alone is therefore NOT a rollback any more
+(back up `~/.hermes/state.db`, `config.yaml` and `~/.local/bin/hermes` first). The v0.22.2 handoff
+carries an UNVERIFIED candidate sequence (`python -m pm.cli install` with the store Python, extras
+from `pm.extras.legacy_selection`, then a first launch from a shell); the lead must validate it on
+a scratch copy before the first promotion and then rewrite this section.
+
+Pre-v0.22.2 procedure, kept for reference and rollback to an older tag:
 
 ```bash
 cd ~/.hermes/hermes-agent && git fetch "$P" chore/upstream-merge-$YM && git merge --ff-only FETCH_HEAD   # live tree must be clean
@@ -195,6 +285,8 @@ Rollback if any check fails: `git reset --hard <ROLLBACK_SHA>` in the live check
   (same frontmatter schema; parent = previous handoff id).
 - `~/.hermes/scripts/check-gateway-fork-invariants.sh`: update symbol/file checks if a fork helper
   moved (2026-09: update restart moved to `update_cmd_fleet.py`); commit only that file in `~/.hermes`.
+  2026-10-18: its check 2b still greps `hermes_cli/gateway.py` for the install guard, which has lived
+  in `hermes_cli/gateway_launchd.py` since the v2026.9.24 split, so it already fails on live `main`.
 - `~/.hermes/skills/hermes/hermes-install-lifecycle/SKILL.md` points here.
 - After a day's soak: `$W remove upstream-merge-$YM` (handles the immutable-flag files; `--force` if
   it is dirty), then `git branch -d` the merged local branches. Do NOT bulk-delete other local
