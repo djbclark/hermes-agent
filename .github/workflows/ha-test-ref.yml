@@ -108,6 +108,20 @@ jobs:
           echo "==== FAILED/ERROR ids (all shards) ===="
           grep -hE '^(FAILED|ERROR) ' summaries/*/summary.txt summaries/*/*/summary.txt 2>/dev/null | sort -u || true
           echo "shards_with_nonzero_exit=$failed_shards"
+          echo "==== TOTAL SUMMARY ===="
+          python3 -c "
+import glob, re
+passed = failed = skipped = files = 0
+for f in sorted(set(glob.glob('summaries/*/summary.txt') + glob.glob('summaries/*/*/summary.txt'))):
+    for line in open(f):
+        m = re.search(r'=== Summary: (\d+) files?, (\d+) tests? passed(?:, (\d+) failed)?(?:, (\d+) skipped)?', line)
+        if m:
+            files += int(m.group(1))
+            passed += int(m.group(2))
+            failed += int(m.group(3) or 0)
+            skipped += int(m.group(4) or 0)
+print(f'TOTAL: {files} files, {passed} passed, {failed} failed, {skipped} skipped')
+" || true
           # Aggregate job stays green so the wrapper can parse logs even when
           # tests fail; the shard jobs carry the real failure status.
           exit 0

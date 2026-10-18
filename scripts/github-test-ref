@@ -210,7 +210,7 @@ push_and_watch() {
   local log="$logdir/run-$run_id.log"
   gh run view "$run_id" -R "$repo" --log > "$log" 2>"$logdir/run-$run_id.log.err" || true
   echo "---- $label ($status) log $log ----"
-  ggrep -E '^(FAILED|ERROR) |[0-9]+ (files?|tests?) passed|[0-9]+ failed|BENCHSTEP|shards_with_nonzero|==== ' "$log" | tail -n 120 || true
+  ggrep -E '^(FAILED|ERROR) |[0-9]+ (files?|tests?) passed|[0-9]+ failed|BENCHSTEP|shards_with_nonzero|==== |TOTAL:' "$log" | tail -n 120 || true
   echo "-- FAILED/ERROR node ids --"
   ggrep -E '^(FAILED|ERROR) ' "$log" | sort -u | tail -n 200 || true
   echo "run $run_id: $status ($url)"

@@ -55,16 +55,25 @@ echo "BENCHSTEP run_tests workers=${HERMES_TEST_WORKERS:-4} slice=${HERMES_TEST_
 # shellcheck disable=SC1091
 source .venv/bin/activate
 
+cur_slice="${HERMES_TEST_SLICE:-all}"
+slice_args=()
+if [ -n "${HERMES_TEST_SLICE:-}" ]; then
+  slice_args=(--slice "$HERMES_TEST_SLICE")
+  # Unset HERMES_TEST_SLICE so test suites testing the runner (like
+  # tests/scripts/test_run_tests_parallel.py) don't inherit the outer slice.
+  unset HERMES_TEST_SLICE
+fi
+
 mkdir -p "$GITHUB_WORKSPACE/_ci_summary"
 log="$GITHUB_WORKSPACE/_ci_summary/run.log"
 set +e
-scripts/run_tests.sh 2>&1 | tee "$log"
+scripts/run_tests.sh "${slice_args[@]}" 2>&1 | tee "$log"
 rc=${PIPESTATUS[0]}
 set -e
 
 summary="$GITHUB_WORKSPACE/_ci_summary/summary.txt"
 {
-  echo "slice=${HERMES_TEST_SLICE:-all}"
+  echo "slice=$cur_slice"
   echo "ref=${TARGET_REF:-}"
   echo "sha=$(git rev-parse HEAD)"
   echo "exit=$rc"
