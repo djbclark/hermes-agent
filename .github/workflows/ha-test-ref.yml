@@ -1,0 +1,127 @@
+name: Pytest on ci/run ref (sharded)
+
+# Lives on ci/base only. scripts/github-test-ref builds an overlay commit
+# (target tree + this workflow/scripts, other .github/workflows deleted) and
+# pushes it to ci/run/<shortsha>-<ts>, which triggers this workflow.
+# ~10 duration-balanced shards via scripts/run_tests_parallel.py --slice I/N
+# (LPT on test_durations.json when present; otherwise by file count).
+# Standard ubuntu-latest (4 vCPU); free-plan concurrency cap ~20 jobs.
+
+on:
+  push:
+    branches:
+      - "ci/run/**"
+
+concurrency:
+  group: ha-test-ref-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Parse target ref label from the branch name when present; overlay commit
+  # message also carries it. Used only for log labels.
+  TARGET_REF: ${{ github.ref_name }}
+
+jobs:
+  test:
+    name: shard ${{ matrix.shard }}/10
+    runs-on: ubuntu-latest
+    timeout-minutes: 135
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      - name: Checkout overlay commit
+        uses: actions/checkout@v4
+
+      - name: Restore per-file duration cache
+        uses: actions/cache/restore@v4
+        with:
+          path: test_durations.json
+          key: test-durations-never-exact
+          restore-keys: |
+            test-durations-
+
+      - name: Setup and run unit tests (slice ${{ matrix.shard }}/10)
+        id: run
+        timeout-minutes: 120
+        env:
+          HERMES_TEST_WORKERS: "4"
+          HERMES_TEST_SLICE: "${{ matrix.shard }}/10"
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+          TARGET_REF: ${{ github.ref_name }}
+        run: bash .github/scripts/run-unit-tests.sh
+
+      - name: Upload shard summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}-summary
+          path: _ci_summary/
+          if-no-files-found: warn
+
+      - name: Save per-file duration cache
+        if: always() && hashFiles('test_durations.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: test_durations.json
+          key: test-durations-${{ github.run_id }}-s${{ matrix.shard }}
+
+  aggregate:
+    name: aggregate results
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download shard summaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*-summary
+          path: summaries
+          merge-multiple: false
+
+      - name: Print passed/failed counts and FAILED ids
+        run: |
+          set -euo pipefail
+          echo "==== aggregate for ${{ github.ref_name }} ===="
+          echo "run ${{ github.run_id }} ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          failed_shards=0
+          for d in summaries/shard-*-summary summaries/*/; do
+            [ -d "$d" ] || continue
+            s="$d/summary.txt"
+            if [ -f "$s" ]; then
+              echo "---- $(basename "$(dirname "$s")" 2>/dev/null || basename "$d") ----"
+              cat "$s"
+              if grep -q '^exit=0$' "$s"; then
+                :
+              else
+                failed_shards=$((failed_shards + 1))
+              fi
+            fi
+          done
+          echo "==== FAILED/ERROR ids (all shards) ===="
+          grep -hE '^(FAILED|ERROR) ' summaries/*/summary.txt summaries/*/*/summary.txt 2>/dev/null | sort -u || true
+          echo "shards_with_nonzero_exit=$failed_shards"
+          echo "==== TOTAL SUMMARY ===="
+          python3 -c "
+import glob, re
+passed = failed = skipped = files = 0
+for f in sorted(set(glob.glob('summaries/*/summary.txt') + glob.glob('summaries/*/*/summary.txt'))):
+    for line in open(f):
+        m = re.search(r'=== Summary: (\d+) files?, (\d+) tests? passed(?:, (\d+) failed)?(?:, (\d+) skipped)?', line)
+        if m:
+            files += int(m.group(1))
+            passed += int(m.group(2))
+            failed += int(m.group(3) or 0)
+            skipped += int(m.group(4) or 0)
+print(f'TOTAL: {files} files, {passed} passed, {failed} failed, {skipped} skipped')
+" || true
+          # Aggregate job stays green so the wrapper can parse logs even when
+          # tests fail; the shard jobs carry the real failure status.
+          exit 0
