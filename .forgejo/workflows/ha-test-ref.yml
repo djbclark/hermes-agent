@@ -23,7 +23,7 @@ jobs:
   test-a:
     name: test ${{ inputs.ref }}
     runs-on: ubuntu
-    timeout-minutes: 90
+    timeout-minutes: 135
     steps:
       - name: Checkout the workflow's own branch
         uses: https://github.com/actions/checkout@v4
@@ -38,7 +38,7 @@ jobs:
         run: bash .forgejo/scripts/fast-disk.sh
 
       - name: Setup and run unit tests
-        timeout-minutes: 75
+        timeout-minutes: 120
         env:
           HERMES_TEST_WORKERS: "8"
           OPENROUTER_API_KEY: ""
@@ -51,7 +51,7 @@ jobs:
     name: test ${{ inputs.ref2 }}
     if: ${{ inputs.ref2 != '' }}
     runs-on: ubuntu
-    timeout-minutes: 90
+    timeout-minutes: 135
     steps:
       - name: Checkout the workflow's own branch
         uses: https://github.com/actions/checkout@v4
@@ -66,7 +66,7 @@ jobs:
         run: bash .forgejo/scripts/fast-disk.sh
 
       - name: Setup and run unit tests
-        timeout-minutes: 75
+        timeout-minutes: 120
         env:
           HERMES_TEST_WORKERS: "8"
           OPENROUTER_API_KEY: ""

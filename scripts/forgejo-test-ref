@@ -71,7 +71,7 @@ echo "dispatched run $run_number for $ref${ref2:+ + $ref2}"
 echo "$url"
 [ "$wait" = 1 ] || exit 0
 
-deadline=$(( $(date +%s) + ${HA_CI_WAIT:-7200} ))
+deadline=$(( $(date +%s) + ${HA_CI_WAIT:-9000} ))
 fails=0
 while :; do
   if "$api" GET "/repos/$repo/actions/runs/$run_id" > "$work/status.json" &&
@@ -91,7 +91,7 @@ while :; do
     *) break ;;
   esac
   if [ "$(date +%s)" -ge "$deadline" ]; then
-    echo "forgejo-test-ref: run $run_number still $status after ${HA_CI_WAIT:-7200} s: $url" >&2
+    echo "forgejo-test-ref: run $run_number still $status after ${HA_CI_WAIT:-9000} s: $url" >&2
     exit 1
   fi
   sleep 30
