@@ -6,15 +6,14 @@
     <string>com.djbclark.hermes-memory-journal</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/djbclark/.hermes/hermes-agent/.venv/bin/python</string>
-        <string>/Users/djbclark/.hermes/hermes-agent-worktrees/memory-capacity-guard-v2/cron/scripts/memory_journal_consumer.py</string>
+        <string>/Users/djbclark/.hermes/hermes-agent/.hermes/bin/hermes</string>
+        <string>--run-module</string>
+        <string>cron.scripts.memory_journal_consumer</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
         <key>HERMES_HOME</key>
         <string>/Users/djbclark/.hermes</string>
-        <key>PYTHONPATH</key>
-        <string>/Users/djbclark/.hermes/hermes-agent-worktrees/memory-capacity-guard-v2</string>
         <key>PATH</key>
         <string>/Users/djbclark/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
