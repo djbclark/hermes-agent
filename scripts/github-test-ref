@@ -1,0 +1,258 @@
+#!/usr/bin/env bash
+# github-test-ref — overlay ci/base onto REF, push ci/run/<short>-<ts>, wait, summarize.
+#
+#   scripts/github-test-ref [--no-wait] REF [REF2]
+#   scripts/github-test-ref main
+#   scripts/github-test-ref merge-branch main
+#
+# Lives on the GitHub-only ci/base branch (not on PATH). For each REF, builds a
+# commit whose tree is REF's tree plus the ci/base overlay (.github/workflows/
+# ha-test-ref.yml, .github/scripts/, scripts/github-test-ref), with every other
+# .github/workflows/* deleted so upstream paid-runner workflows cannot queue.
+# Pushes to ci/run/<shortsha>-<ts> on github.com/djbclark/hermes-agent only.
+# Two refs run concurrently (2 × 10 shards = free-plan 20-job cap).
+# Exit 0 = infra OK (test failures are reported but do not fail the wrapper
+# unless --strict); exit non-zero on infra failure (push/dispatch/watch).
+set -euo pipefail
+
+repo=djbclark/hermes-agent
+workflow_ref=ci/base
+remote=origin
+wait=1
+strict=0
+
+usage() {
+  gsed -n '2,18p' "$0" >&2
+  exit 2
+}
+
+if [ $# -lt 1 ]; then usage; fi
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --no-wait) wait=0; shift ;;
+    --strict) strict=1; shift ;;
+    -h|--help) usage ;;
+    --) shift; break ;;
+    -*) echo "github-test-ref: unknown flag $1" >&2; usage ;;
+    *) break ;;
+  esac
+done
+if [ $# -lt 1 ]; then usage; fi
+ref=$1
+ref2=${2:-}
+top=$(git rev-parse --show-toplevel)
+logdir="${GITHUB_TEST_REF_LOGDIR:-$HOME/.local/state/hermes-github-ci}"
+mkdir -p "$logdir"
+
+resolve_sha() {
+  local r=$1
+  if git -C "$top" rev-parse --verify --quiet "$r^{commit}" >/dev/null; then
+    git -C "$top" rev-parse "$r^{commit}"
+    return 0
+  fi
+  if git -C "$top" rev-parse --verify --quiet "refs/remotes/$remote/$r^{commit}" >/dev/null; then
+    git -C "$top" rev-parse "refs/remotes/$remote/$r^{commit}"
+    return 0
+  fi
+  echo "github-test-ref: cannot resolve ref $r (fetch $remote first)" >&2
+  return 1
+}
+
+# Build overlay commit: target tree + files from ci/base overlay, other workflows gone.
+build_overlay_commit() {
+  local target_sha=$1
+  local label=$2
+  local work overlay_list tree commit short ts branch
+  work=$(mktemp -d)
+  trap 'rm -rf "$work"' RETURN
+
+  # Overlay paths that live on ci/base (must exist there).
+  overlay_list=(
+    .github/workflows/ha-test-ref.yml
+    .github/scripts/run-unit-tests.sh
+    scripts/github-test-ref
+    docs/github-ci-test-ref.md
+  )
+
+  git -C "$top" fetch --quiet "$remote" "$workflow_ref" 2>/dev/null || true
+  local base_sha
+  if git -C "$top" rev-parse --verify --quiet "refs/heads/$workflow_ref^{commit}" >/dev/null; then
+    base_sha=$(git -C "$top" rev-parse "refs/heads/$workflow_ref^{commit}")
+  elif git -C "$top" rev-parse --verify --quiet "refs/remotes/$remote/$workflow_ref^{commit}" >/dev/null; then
+    base_sha=$(git -C "$top" rev-parse "refs/remotes/$remote/$workflow_ref^{commit}")
+  else
+    echo "github-test-ref: missing $workflow_ref locally and on $remote" >&2
+    return 1
+  fi
+
+  # Start from target tree in a temporary index.
+  local gitdir
+  gitdir=$(git -C "$top" rev-parse --git-dir)
+  export GIT_INDEX_FILE="$work/index"
+  git -C "$top" read-tree "$target_sha^{tree}"
+
+  # Delete every workflow except the one we are about to add.
+  local path
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    case "$path" in
+      .github/workflows/ha-test-ref.yml) continue ;;
+      *) git -C "$top" update-index --force-remove "$path" 2>/dev/null || true ;;
+    esac
+  done < <(git -C "$top" ls-tree -r --name-only "$target_sha^{tree}" | ggrep '^\.github/workflows/' || true)
+
+  # Also drop workflows that exist only on the index after read-tree (same set).
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    case "$path" in
+      .github/workflows/ha-test-ref.yml) continue ;;
+      .github/workflows/*) git -C "$top" update-index --force-remove "$path" 2>/dev/null || true ;;
+    esac
+  done < <(git -C "$top" ls-files --stage | gawk '{print $4}' | ggrep '^\.github/workflows/' || true)
+
+  # Copy overlay blobs from ci/base into the index.
+  local rel mode
+  for rel in "${overlay_list[@]}"; do
+    if ! git -C "$top" cat-file -e "$base_sha:$rel" 2>/dev/null; then
+      echo "github-test-ref: overlay missing $rel on $workflow_ref ($base_sha)" >&2
+      return 1
+    fi
+    # Preserve executable bit for scripts.
+    mode=$(git -C "$top" ls-tree "$base_sha" "$rel" | gawk '{print $1}')
+    [ -n "$mode" ] || mode=100644
+    case "$rel" in
+      scripts/*|.github/scripts/*) mode=100755 ;;
+    esac
+    git -C "$top" update-index --add --cacheinfo "$mode,$(git -C "$top" rev-parse "$base_sha:$rel"),$rel"
+  done
+
+  tree=$(git -C "$top" write-tree)
+  short=$(git -C "$top" rev-parse --short=8 "$target_sha")
+  ts=$(gdate -u +%Y%m%d%H%M%S)
+  branch="ci/run/${short}-${ts}"
+  commit=$(git -C "$top" commit-tree "$tree" -p "$target_sha" -m "$(cat <<EOF
+ci: overlay ha-test-ref for ${label} (${short})
+
+Target: ${target_sha}
+Overlay: ${workflow_ref} (${base_sha})
+Branch: ${branch}
+EOF
+)")
+  unset GIT_INDEX_FILE
+
+  echo "$commit $branch $short" 
+}
+
+push_and_watch() {
+  local target_sha=$1
+  local label=$2
+  local out commit branch short run_id url
+  out=$(build_overlay_commit "$target_sha" "$label")
+  commit=$(echo "$out" | gawk '{print $1}')
+  branch=$(echo "$out" | gawk '{print $2}')
+  short=$(echo "$out" | gawk '{print $3}')
+
+  echo "github-test-ref: pushing $commit -> $remote $branch (target $label=$short)"
+  if ! timeout 600 git -C "$top" push "$remote" "$commit:refs/heads/$branch"; then
+    echo "github-test-ref: push failed for $branch" >&2
+    return 1
+  fi
+
+  # Find the workflow run for this branch (poll briefly).
+  local i=0
+  run_id=""
+  while [ "$i" -lt 30 ]; do
+    run_id=$(gh run list -R "$repo" --branch "$branch" --workflow "ha-test-ref.yml" --limit 1 --json databaseId --jq '.[0].databaseId // empty' 2>/dev/null || true)
+    if [ -n "$run_id" ]; then
+      break
+    fi
+    # Workflow filename may not match list filter; fall back to branch only.
+    run_id=$(gh run list -R "$repo" --branch "$branch" --limit 1 --json databaseId,name --jq '.[0].databaseId // empty' 2>/dev/null || true)
+    if [ -n "$run_id" ]; then
+      break
+    fi
+    sleep 5
+    i=$((i + 1))
+  done
+  if [ -z "$run_id" ]; then
+    echo "github-test-ref: no run appeared for $branch" >&2
+    return 1
+  fi
+  url="https://github.com/$repo/actions/runs/$run_id"
+  echo "dispatched run $run_id for $label"
+  echo "$url"
+  echo "$run_id $url $branch $label" >> "$logdir/last-runs.txt"
+
+  if [ "$wait" != 1 ]; then
+    echo "$run_id"
+    return 0
+  fi
+
+  # Watch in ≤8-minute chunks (Cursor/acp turn limit).
+  local deadline status
+  deadline=$(( $(date +%s) + ${HA_CI_WAIT:-9000} ))
+  status=unknown
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if timeout 480 gh run watch "$run_id" -R "$repo" --exit-status; then
+      status=success
+      break
+    fi
+    # watch exits non-zero on failure OR on interrupt; check actual status.
+    status=$(gh run view "$run_id" -R "$repo" --json status,conclusion --jq '.status + ":" + (.conclusion // "")')
+    case "$status" in
+      completed:success) status=success; break ;;
+      completed:*) status=${status#completed:}; break ;;
+      *) echo "github-test-ref: still $status for $run_id; re-watching" ;;
+    esac
+  done
+
+  # Fetch logs and print summaries.
+  local log="$logdir/run-$run_id.log"
+  gh run view "$run_id" -R "$repo" --log > "$log" 2>"$logdir/run-$run_id.log.err" || true
+  echo "---- $label ($status) log $log ----"
+  ggrep -E '^(FAILED|ERROR) |[0-9]+ (files?|tests?) passed|[0-9]+ failed|BENCHSTEP|shards_with_nonzero|==== |TOTAL:' "$log" | tail -n 120 || true
+  echo "-- FAILED/ERROR node ids --"
+  ggrep -E '^(FAILED|ERROR) ' "$log" | sort -u | tail -n 200 || true
+  echo "run $run_id: $status ($url)"
+
+  if [ "$status" != success ] && [ "$status" != failure ] && [ "$status" != cancelled ]; then
+    echo "github-test-ref: infra/incomplete status $status for $run_id" >&2
+    return 1
+  fi
+  if [ "$strict" = 1 ] && [ "$status" != success ]; then
+    return 1
+  fi
+  # Non-strict: test failures (conclusion=failure) are OK for the wrapper;
+  # only unknown/infra fails. Cancelled counts as infra.
+  if [ "$status" = cancelled ]; then
+    return 1
+  fi
+  return 0
+}
+
+target1=$(resolve_sha "$ref")
+echo "github-test-ref: $ref -> $target1"
+
+if [ -n "$ref2" ]; then
+  target2=$(resolve_sha "$ref2")
+  echo "github-test-ref: $ref2 -> $target2"
+  # Two refs concurrently.
+  work=$(mktemp -d)
+  push_and_watch "$target1" "$ref" >"$work/a.out" 2>"$work/a.err" &
+  pid1=$!
+  push_and_watch "$target2" "$ref2" >"$work/b.out" 2>"$work/b.err" &
+  pid2=$!
+  ec1=0; ec2=0
+  wait "$pid1" || ec1=$?
+  wait "$pid2" || ec2=$?
+  echo "==== $ref ===="
+  cat "$work/a.out" || true
+  cat "$work/a.err" >&2 || true
+  echo "==== $ref2 ===="
+  cat "$work/b.out" || true
+  cat "$work/b.err" >&2 || true
+  rm -rf "$work"
+  [ "$ec1" = 0 ] && [ "$ec2" = 0 ]
+else
+  push_and_watch "$target1" "$ref"
+fi
