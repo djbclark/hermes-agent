@@ -241,14 +241,19 @@ def _live_system_guard(request, monkeypatch):
     )
 
     def _is_blocked_launchctl(cmd) -> bool:
+        # Only operator-managed labels (anything hermes-named outside upstream's own
+        # ``ai.hermes.*`` namespace): upstream tests deliberately bootout a random,
+        # never-loaded ``ai.hermes.gateway-<hash>`` label to exercise stderr handling.
         cmd_str = _cmd_to_string(cmd)
-        if "launchctl" not in cmd_str or "hermes" not in cmd_str.lower():
+        if "launchctl" not in cmd_str:
             return False
         try:
             tokens = _shlex.split(cmd_str)
         except ValueError:
             tokens = cmd_str.split()
-        return any(verb in tokens for verb in _LAUNCHCTL_MUTATING_VERBS)
+        if not any(verb in tokens for verb in _LAUNCHCTL_MUTATING_VERBS):
+            return False
+        return any("hermes" in tok.lower() and "ai.hermes." not in tok.lower() for tok in tokens[1:])
 
     def _is_process_killer(cmd) -> bool:
         cmd_str = _cmd_to_string(cmd)

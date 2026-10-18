@@ -1487,6 +1487,8 @@ class TestForeignLaunchdGatewayStopStart:
         calls = []
         monkeypatch.setattr(gateway_cli, "_stop_foreign_launchd_gateway", lambda label, domain, pid: calls.append(("stop", label)))
         monkeypatch.setattr(gateway_cli, "stop_profile_gateway", lambda: calls.append("pidkill") or True)
+        # v0.22.2 _cmd_stop scans real processes first (host-gateway refusal); the foreign job's PID.
+        monkeypatch.setattr(gateway_cli, "find_gateway_pids", lambda *a, **k: [4242])
 
         gateway_cli.gateway_command(SimpleNamespace(gateway_command="stop", system=False))
 
