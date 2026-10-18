@@ -69,6 +69,9 @@ UNREDIRECTABLE_AUTH = {
 }
 KEYLESS_PROVIDERS = {
     "custom": "user-defined endpoint keyed by config api_key; covered by test_chat_custom_endpoint.py",
+    # FORK(opencode-zen-keyless): no credential env var at all; covered by
+    # tests/hermes_cli/test_opencode_zen_free_keyless.py.
+    "opencode-free": "keyless OpenCode Zen free tier; covered by test_opencode_zen_free_keyless.py",
 }
 # Hosts a hermetic run may reach without carrying any vendor credential.
 CREDENTIAL_FREE_HOSTS = frozenset({"models.dev:443"})
@@ -210,7 +213,10 @@ def hermetic_env(home: Path, extra: dict[str, str]) -> dict[str, str]:
 def write_home(root: Path, model: dict[str, Any], extra_cfg: dict[str, Any] | None = None) -> Path:
     home = root / "home"
     (home / ".hermes").mkdir(parents=True, exist_ok=True)
-    cfg = {"model": {"default": "catalog-model-a", "context_length": 128000, **model},
+    # FORK(opencode-zen-free-policy): the fake's models carry no models.dev pricing, so the
+    # free-only guard would refuse opencode-zen rows; the catalog tests exercise transport.
+    cfg = {"model": {"default": "catalog-model-a", "context_length": 128000,
+                     "allow_paid_opencode_zen": True, **model},
            # auto_recovery_cycles: 0 — the documented post-exhaustion ladder (15/30/60/60/60 s) would
            # otherwise park a transport-failed turn for minutes; one bounded attempt is the contract here.
            "agent": {"api_max_retries": 1, "auto_recovery_cycles": 0}, "updates": {"check": False},

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -106,6 +107,15 @@ class Store:
     skill_texts: list[str]
 
     def pending_ids(self, subsystem: str) -> set[str]:
+        if subsystem == "memory":
+            # FORK(memory-capacity-guard): MEMORY approvals live in the journal DB, not pending/memory/.
+            db = self.hermes_home / "memory_pending.db"
+            if not db.is_file():
+                return set()
+            with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
+                rows = conn.execute("SELECT id FROM pending_ops WHERE kind = 'approval' "
+                                    "AND status IN ('pending', 'processing', 'failed')").fetchall()
+            return {r[0] for r in rows}
         d = self.hermes_home / "pending" / subsystem
         return {p.stem for p in d.glob("*.json")} if d.is_dir() else set()
 

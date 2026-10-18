@@ -190,7 +190,9 @@ def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
     # any unrecognized bearer) — blank the Authorization header.
     with contextlib.suppress(Exception):
         from hermes_cli.opencode_zen_keyless import merge_keyless_default_headers
-        kwargs["default_headers"] = merge_keyless_default_headers(api_key, kwargs.get("default_headers"))
+        merged_headers = merge_keyless_default_headers(api_key, kwargs.get("default_headers"))
+        if merged_headers is not None:  # never add an explicit default_headers=None
+            kwargs["default_headers"] = merged_headers
     _apply_required_codex_headers(kwargs, access_token=api_key, base_url=base_url)
     # Hermes owns aux retry/fallback policy; the SDK default (max_retries=2) would triple
     # wall time on a hung endpoint before Hermes sees one failure.
