@@ -22,6 +22,8 @@ def run_aiuse_for_chat(*, timeout: float = 60.0) -> str:
             [executable, "--for-chat", "-q"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             check=False,
         )

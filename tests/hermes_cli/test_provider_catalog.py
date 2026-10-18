@@ -51,7 +51,7 @@ def test_api_key_providers_expose_a_credential_env_var():
     ``custom`` bring-your-own-endpoint pseudo-provider (configured inline via
     the ``local-endpoint`` flow).
     """
-    exempt = {"custom"}
+    exempt = {"custom", "opencode-free"}  # FORK(opencode-zen-keyless): keyless, nothing to paste
     for d in provider_catalog():
         if d.auth_type == "api_key" and d.slug not in exempt:
             assert d.api_key_env_vars, f"{d.slug} is api_key but exposes no env var"

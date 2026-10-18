@@ -34,6 +34,8 @@ def test_run_aiuse_uses_fixed_for_chat_arguments(monkeypatch) -> None:
             {
                 "capture_output": True,
                 "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
                 "timeout": 60.0,
                 "check": False,
             },

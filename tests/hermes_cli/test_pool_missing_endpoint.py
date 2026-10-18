@@ -23,7 +23,8 @@ def test_missing_pool_endpoint_uses_provider_default(endpoint, requested):
     default = PROVIDER_REGISTRY["opencode-zen"].inference_base_url
     fields = {} if endpoint is None else {"base_url": default if endpoint == "default" else endpoint}
     _store_entry("opencode-zen", **fields)
-    runtime = resolve_runtime_provider(requested=requested, target_model="glm-5.3")
+    # FORK(opencode-zen-free-policy): paid Zen models need the explicit opt-in.
+    runtime = resolve_runtime_provider(requested=requested, target_model="glm-5.3", allow_paid_opencode_zen=True)
     assert runtime["base_url"] == default
     assert runtime["api_key"] == KEY
     assert runtime["source"] == "manual"
@@ -51,7 +52,9 @@ def test_pool_endpoint_preserves_entry_and_provider_config_boundaries(entry_url,
 
 def test_missing_endpoint_still_finalizes_anthropic_wire():
     _store_entry("opencode-zen")
-    runtime = resolve_runtime_provider(requested="opencode-zen", target_model="claude-sonnet-4-6")
+    # FORK(opencode-zen-free-policy): paid Zen models need the explicit opt-in.
+    runtime = resolve_runtime_provider(requested="opencode-zen", target_model="claude-sonnet-4-6",
+                                       allow_paid_opencode_zen=True)
     default = PROVIDER_REGISTRY["opencode-zen"].inference_base_url
     assert runtime["api_mode"] == "anthropic_messages"
     assert runtime["base_url"] == default.removesuffix("/v1")

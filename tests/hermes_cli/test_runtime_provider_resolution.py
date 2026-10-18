@@ -2225,17 +2225,12 @@ def test_custom_provider_pool_target_model_wins(monkeypatch):
 
 @pytest.mark.parametrize("name", ["opencode-free", "free", "opencode_free"])
 def test_removed_keyless_free_provider_points_at_its_replacements(name):
-    """The keyless OpenCode free tier is gone (the relay 403s anonymous traffic), so a persisted
-    ``model.provider`` — or ``--provider`` — still naming it must fail with the removal hint
-    naming both surviving OpenCode providers, not a bare "Unknown provider"."""
-    from hermes_cli.auth import AuthError, resolve_provider
+    """FORK(opencode-zen-keyless): upstream removed the keyless OpenCode free tier and expects a
+    removal hint here; the fork keeps the provider (anonymous Zen relay headers), so every alias
+    still resolves to it."""
+    from hermes_cli.auth import resolve_provider
 
-    with pytest.raises(AuthError) as excinfo:
-        resolve_provider(name)
-
-    assert excinfo.value.code == "invalid_provider"
-    message = str(excinfo.value)
-    assert "opencode-zen" in message and "opencode-go" in message
+    assert resolve_provider(name) == "opencode-free"
 
 
 def test_bare_custom_resolves_model_key_env_for_configured_base_url(monkeypatch):
