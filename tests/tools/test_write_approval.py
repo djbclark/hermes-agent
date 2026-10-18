@@ -36,13 +36,15 @@ def _set_approval(subsystem, enabled):
 def test_list_pending_skips_non_dict_record(hermes_home):
     """A parseable-but-non-object pending file must be skipped, not crash the sort."""
     from tools import write_approval as wa
-    wa.stage_write("memory", {"action": "add", "target": "user", "content": "ok"},
+    # FORK(memory-capacity-guard): MEMORY records live in the journal DB, so the file-backed
+    # store is exercised through SKILLS.
+    wa.stage_write("skills", {"action": "create", "name": "ok", "content": "ok"},
                    summary="ok", origin="foreground")
-    pending_dir = wa._pending_path("memory", "").parent
+    pending_dir = wa._pending_path("skills", "").parent
     (pending_dir / "bad.json").write_text('"not a record"', encoding="utf-8")
-    records = wa.list_pending("memory")
+    records = wa.list_pending("skills")
     assert len(records) == 1 and records[0]["payload"]["content"] == "ok"
-    assert wa.get_pending("memory", "bad") is None
+    assert wa.get_pending("skills", "bad") is None
 
 def test_normalize_enabled_coerces_values():
     from tools import write_approval as wa
@@ -252,11 +254,14 @@ def test_approve_refuses_unpinned_legacy_remove(hermes_home):
     from hermes_cli.write_approval_commands import handle_pending_subcommand
     from tools.memory_tool import load_on_disk_store
     from tools import write_approval as wa
+    from tools import memory_pending_queue as _pq
     _store, pid = _review_stages_remove("single")
-    path = wa._pending_path(wa.MEMORY, pid)
-    record = json.loads(path.read_text(encoding="utf-8"))
-    record["payload"].pop("matched_entry", None)
-    path.write_text(json.dumps(record), encoding="utf-8")
+    # FORK(memory-capacity-guard): MEMORY records live in the journal DB, not pending/memory/*.json.
+    payload = dict(wa.get_pending(wa.MEMORY, pid)["payload"])
+    payload.pop("matched_entry", None)
+    with _pq._connection() as conn:
+        conn.execute("UPDATE pending_ops SET payload = ? WHERE id = ?", (json.dumps(payload), pid))
+        conn.commit()
     assert "unpinned legacy target" in handle_pending_subcommand(wa.MEMORY, ["pending"])
 
     out = handle_pending_subcommand(wa.MEMORY, ["approve", pid], memory_store=load_on_disk_store())
@@ -409,7 +414,9 @@ def test_staged_hint_names_the_pending_dir_on_headless_surfaces(hermes_home, mon
     r = _stage_one_memory_write()
     assert "review with /memory pending" not in r["message"], r["message"]
     assert "pending records live in" in r["message"]
-    assert str(wa._pending_path(wa.MEMORY, "").parent) in r["message"]
+    from tools import memory_pending_queue as _pq
+    # FORK(memory-capacity-guard): MEMORY records live in the journal DB.
+    assert str(_pq.queue_db_path()) in r["message"]
     monkeypatch.delenv("HERMES_CRON_SESSION")
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-7")
@@ -422,7 +429,8 @@ def test_staged_hint_names_the_pending_dir_on_headless_surfaces(hermes_home, mon
     assert "review with /memory pending" not in r["message"], r["message"]
     assert "pending records live in" in r["message"]
     monkeypatch.delenv("HERMES_SESSION_PLATFORM")
-    assert wa.pending_count("memory") == 3
+    # FORK(memory-capacity-guard): the journal dedupes the three identical writes into one record.
+    assert wa.pending_count("memory") == 1
 
 
 def test_staged_hint_keeps_command_for_chat_gateway_platform(hermes_home, monkeypatch):

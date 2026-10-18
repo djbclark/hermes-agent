@@ -279,9 +279,12 @@ class TestMemoryStoreReplace:
         assert store.memory_entries == ["Deploys: Fly.io, 30m canary.", "Host: forge", "fleet (Zeus hub)",
                                         "Tests: make test-fast", 'Literal sequence " - inside a note']
 
-    def test_failures_name_the_fix(self, store):
+    def test_failures_name_the_fix(self, store, monkeypatch):
         """A refused write names the fix: the chars to free, and for an old_text that matches
         nothing, the entries it most resembles. Empty content falls back to new_text (#90468)."""
+        # FORK(memory-capacity-guard): the guard journals writes from 85% instead of refusing;
+        # lift its threshold so upstream's refusal path is what runs here.
+        monkeypatch.setattr("tools.memory_capacity_guard.MEMORY_QUEUE_PCT", 101)
         store.add("memory", "Deploys go through GitHub Actions to Fly.io with manual approval.")
         store.add("memory", "x" * 380)  # 65 + 3 + 380 = 448 of 500
         full = store.add("memory", "y" * 54)  # 448 + 3 + 54 = 505

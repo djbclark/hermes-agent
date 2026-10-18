@@ -235,7 +235,9 @@ def _staged(subsystem: str) -> GateDecision:
     if _slash_review_surface():
         where = f"review with {command}"
     else:
-        where = (f"pending records live in {_pending_path(subsystem, '').parent} "
+        # FORK(memory-capacity-guard): MEMORY records live in the journal DB, not pending/memory/.
+        location = _pq.queue_db_path() if subsystem == MEMORY else _pending_path(subsystem, '').parent
+        where = (f"pending records live in {location} "
                  f"(review from an interactive CLI session with {command})")
     return GateDecision(stage=True, message=(f"Staged for approval ({subsystem}.write_approval is on). "
                                              f"Not yet saved — {where}."))
