@@ -462,7 +462,12 @@ Rebuild with the gateway running, never in the downtime window. The command is U
 desktop-only run: `hermes_cli/source_completion.py` takes `--desktop` (read in source), so
 `(cd $C && env -u PYTHONPATH -u PYTHONHOME -u VIRTUAL_ENV $PY -I -B -u hermes_cli/source_completion.py --source $C --finish-update --desktop)`
 with `PY` = the store Python (`ls -d ~/.hermes/tools/python-3.14.*/bin/python3 | tail -1`)
-should do it. Do not swap the running desktop app out from under the operator; leave that to them
+should do it. **It re-installs the lefthook `pre-commit` hook** that step (h) removed (measured
+2026-10-19 11:04: the rebuild wrote `.git/hooks/pre-commit` and `.git/info/lefthook.checksum`, and
+the next commit in the live checkout ran lefthook). Remove both again afterwards — the hook is
+shared by every fork worktree and needs `ruff`/`npx`:
+`rm -f $C/.git/hooks/pre-commit $C/.git/info/lefthook.checksum`.
+Do not swap the running desktop app out from under the operator; leave that to them
 (`~/.hermes/skills/hermes/hermes-install-lifecycle/SKILL.md`: the installed app is packaged, so
 editing `apps/desktop/src` changes nothing until it is rebuilt, and the running app is theirs to swap).
 
