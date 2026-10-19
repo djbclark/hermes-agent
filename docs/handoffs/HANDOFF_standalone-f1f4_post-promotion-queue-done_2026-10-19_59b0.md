@@ -37,6 +37,11 @@ was restarted.
    `/Applications/Hermes.app` (a June "Hermes-Setup" stub) are NOT Hermes-managed: no install stamp,
    and `~/.hermes/desktop-installed-apps.json` does not exist, so `_refresh_installed_desktop_apps`
    owns nothing. Operator question if they care: should the installed app be adopted?
+   **Side effect found and fixed:** that rebuild re-installed the lefthook `pre-commit` hook the
+   promotion had removed (`.git/hooks/pre-commit` + `.git/info/lefthook.checksum`, both 11:04; the
+   next commit in the live checkout ran lefthook). Both removed again; playbook §6's after-soak
+   subsection now warns about it (`01a91eb684`). The fork-invariant script does not check for the
+   hook — worth adding if it keeps coming back.
 2. **b. Old-venv consumers — 2 of 7 moved; the other 5 cannot, with evidence.** `~/.hermes` commit
    `f92bb42`. `--run-module` takes a *dotted module only* (`runpy.run_module`; no path, no `-c`, no
    stdin), so only `memory-journal-consumer.sh` (module `cron.scripts.memory_journal_consumer`) and
