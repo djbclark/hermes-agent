@@ -10,7 +10,8 @@ reconstructs what it decided. Every merge writes both a conflict map and a hando
 
 **v0.22.2 changed promotion fundamentally (§6):** upstream's new `pm/` package owns the runtime
 environment (Python 3.14 store interpreter, venv under `$HERMES_HOME/installs/`), so the old
-`uv pip install -e '.[all]' --python venv/bin/python` step no longer works.
+`uv pip install -e '.[all]' --python venv/bin/python` step no longer works. §6 is the rehearsed and
+run recipe (2026-10-18); §7 lists the cleanups that follow it.
 
 ## 0. Hard rules
 
@@ -225,6 +226,8 @@ rm -rf "$Q/.venv" "$Q/venv"; git -C "$Q" checkout -q --detach $T; ln -s "$P/.ven
 # github.com/djbclark/hermes-agent (docs/github-ci-test-ref.md there). From any fork checkout:
 #   git fetch origin ci/base && git checkout origin/ci/base -- scripts/github-test-ref
 #   scripts/github-test-ref <merged-ref> <pristine-ref>     # 10 shards, ~9 min; pushes only ci/run/**
+# (proven 2026-10-19 on fork main: 8m49s, 49726 passed / 20 failed; 17 of the 20 fail on main itself, 3 are CI
+# self-tests that need the workflow files the overlay removes)
 # CI under load flakes: on 2026-10-18 8 of 9 merged-only ids passed serially; re-run merged-only ids
 # serially on both trees (`-p no:xdist`) before calling them merge-caused. (The earlier Hyades/Forgejo
 # route, scripts/forgejo-test-ref on ha/base, is retired; that repo was deleted.)
@@ -251,51 +254,288 @@ The live dev venv `~/.hermes/hermes-agent/.venv` was rebuilt with the command ab
 
 ## 6. Promotion and rollback
 
-**OBSOLETE FROM v0.22.2 — do not run the block below as written.** It installs into the checkout's
-3.11 `venv/`; v0.22.2 gates every runtime dependency on `python_version >= '3.14'` and runs from a
-pm-managed environment (`$HERMES_HOME/installs/<sha16(checkout)>/environments/<uuid>/venv`, store
-Python 3.14 from `~/.hermes/tools`). `update_cmd_deps._refresh_active_lazy_features` is now a stub
-that calls `stop_for_relaunch()`. Also new: the first launch publishes `<checkout>/.hermes/bin/hermes`
-and rewrites `~/.local/bin/hermes` (the shim both `com.stayturgid.hermes-gateway` and
-`com.djbclark.hermes-dashboard` exec) unless `cli.expose_on_path: false`; state DB schema 30 → 31
-and config version → 50 migrate forward-only. `git reset` alone is therefore NOT a rollback any more
-(back up `~/.hermes/state.db`, `config.yaml` and `~/.local/bin/hermes` first). The v0.22.2 handoff
-carries an UNVERIFIED candidate sequence (`python -m pm.cli install` with the store Python, extras
-from `pm.extras.legacy_selection`, then a first launch from a shell); the lead must validate it on
-a scratch copy before the first promotion and then rewrite this section.
+Rewritten 2026-10-19 from the v0.22.2 promotion: rehearsed on three scratch copies, run for real on
+2026-10-18 (third attempt; the first two were rolled back, see Lessons). Since v0.22.2 the live
+checkout runs from a pm-managed environment (`$HERMES_HOME/installs/<sha16(checkout)>/environments/<uuid>/venv`,
+store Python 3.14 from `~/.hermes/tools`), not from the checkout's 3.11 `venv/`; every runtime
+dependency is gated on `python_version >= '3.14'`. The first launch also publishes
+`<checkout>/.hermes/bin/hermes` and rewrites `~/.local/bin/{hermes,hermes-acp,hermes-agent}` (the
+shim both `com.stayturgid.hermes-gateway` and `com.djbclark.hermes-dashboard` exec) unless
+`cli.expose_on_path: false`. **State is forward-only:** config 34 → 50 and state.db 30 → 31 migrate
+and do not migrate back, so `git reset` is NOT a rollback. The rollback script below is.
 
-Pre-v0.22.2 procedure, kept for reference and rollback to an older tag:
+Run it from a plain Terminal (or an agent session that is not a Hermes session: the gateway
+stops mid-run and would take a Telegram/Discord/ACP session with it).
+
+**The drivers live outside the repo** (UNVERIFIED that they persist; copy them somewhere durable
+before relying on them, and ask djbclark which repo they belong in):
+
+| script | does |
+|---|---|
+| `~/.local/state/hermes-promote/prewarm.sh EXTRAS_FILE` | fills pm's uv cache while the gateway is up (step 3) |
+| `~/.local/state/hermes-promote/promote-run.sh TARGET_SHA` | the whole window: stop jobs, promote, go/no-go, start jobs, auto-rollback |
+| `~/.local/state/bigteam/adhoc-2026-10-18/hm-promo-rehearsal/bin-tools/hermes-promote.sh BK TARGET SRC REF` | backups + fast-forward + `pm install` + first launch + completion tail (generic: arguments only) |
+| `~/.local/state/bigteam/adhoc-2026-10-18/hm-promo-rehearsal/bin-tools/hermes-rollback.sh BK [SHA]` | the rollback (generic) |
+
+`promote-run.sh` hard-codes v0.22.2 specifics: the live rollback point
+(`09750eb58f9103b4914a6355446905b9cf4cac6d`, checked in its preflight), the pasture path
+`~/.cow/pastures/hermes-agent/upstream-merge-2026-10`, branch `chore/upstream-merge-2026-10` and
+the backup name `v0.22.2-<date>-<hhmm>`. Copy it and change those constants for the next merge.
+
+**Lessons (2026-10-18).** Each is enforced by the driver, but know why:
+
+a. **Pre-warm pm's uv cache `~/.hermes/cache/uv`** (NOT `~/.cache/uv`) with the gateway still up.
+   Attempt 2 (19:21) stopped the gateway, then `pm install`'s `uv sync` crawled at ~15 KB/s, hit pm's
+   1800 s limit (`uv sync timed out after 1800s`) and was rolled back after a ~31 min outage.
+b. **`launchctl bootout` returns before teardown ends.** Wait for the unload AND for the pid to
+   exit before starting or touching anything. Attempt 1 (19:14) saw the gateway "still loaded" 3 s
+   after bootout, rolled back, and its own `bootstrap` then failed (`Input/output error`), leaving the
+   old gateway down (`OLD GATEWAY NOT UP: needs djbclark`) until it was started by hand. The driver's `out()` waits up to 90 s (and checks
+   twice, since a job caught mid-spawn can read as gone), and `boot()` retries 6 times.
+c. **Run the driver through `~/ops/site-private/bin/bg`** (its load gate delays the start, before the
+   gateway is touched, while the box is overloaded), in the background, never bare.
+d. **Back up before touching anything** (state is forward-only). `hermes-promote.sh` takes the
+   backups in its step b; do not skip it by running the later steps by hand.
+e. **Gate (c) runs on free GitHub runners** (§5), not on this Mac and not on Forgejo/Hyades.
+f. **The desktop app is rebuilt after the soak, with the gateway running** (last subsection). On
+   2026-10-18 the first launch built it inside the window anyway (see the timing table).
+
+### Before the window (gateway up)
 
 ```bash
-cd ~/.hermes/hermes-agent && git fetch "$P" chore/upstream-merge-$YM && git merge --ff-only FETCH_HEAD   # live tree must be clean
-uv pip install -e '.[all]' --python venv/bin/python                     # runtime venv (what `hermes update` does)
-venv/bin/python -c "from hermes_cli.update_cmd_deps import _refresh_active_lazy_features as r; print(r())"   # refresh active lazy backends
-export PATH="$HOME/.local/bin:$PATH"; hermes gateway restart              # from a plain shell, never inside a Hermes session
-hermes gateway status            # "Supervised by launchd job com.stayturgid.hermes-gateway"
-launchctl list | grep hermes-gateway; hermes --version
-tail -60 ~/.hermes/logs/gateway.log     # Telegram/Signal/Discord connected, "Gateway running with N platform(s)", no plugin load errors
-grep -n shutdown_watchdog ~/.hermes/logs/gateway.log | tail -3
-bash ~/.hermes/scripts/check-gateway-fork-invariants.sh; bash ~/.hermes/scripts/check-hindsight-hook-invariants.sh   # both silent
-HERMES_HOME=$(mktemp -d) venv/bin/python -m pytest ~/.hermes/plugins/hindsight-retention-pilot/tests -q
-git push origin main && git -C "$P" push origin chore/upstream-merge-$YM
+# 1. gates a-e green on the pasture (§5). Gate (c) on CI:
+git fetch origin ci/base && git checkout origin/ci/base -- scripts/github-test-ref
+scripts/github-test-ref <merged-ref> <pristine-ref>     # 10 shards, ~9 min; details in §5
+
+# 2. preflight (read-only)
+uptime                                          # 1-min load < ~20
+U=gui/$(id -u); C=~/.hermes/hermes-agent; P=~/.cow/pastures/hermes-agent/upstream-merge-2026-10
+TARGET=$(git -C "$P" rev-parse HEAD)            # the committed merge head; must descend from the live HEAD
+git -C $C status --porcelain                    # must print nothing: promote-run.sh refuses a dirty live checkout
+git -C $C rev-parse HEAD                        # = the rollback point hard-coded in promote-run.sh
+pgrep -fl 'hermes( |$)|hermes-acp'              # the three jobs are expected; ask any interactive hermes/ACP session to finish
+df -h ~ | tail -1                               # 2026-10-18: 49 GiB free; backups are APFS clones, but state.db is a 1.6 GB real copy
+GATEWAY_FORK_DIR=$P SKIP_LAUNCHCTL=1 bash ~/.hermes/scripts/check-gateway-fork-invariants.sh   # must be silent, rc 0 (the go/no-go runs it too, and any failure rolls back)
 ```
-Rollback if any check fails: `git reset --hard <ROLLBACK_SHA>` in the live checkout,
-`uv pip install -e '.[all]' --python venv/bin/python`, `hermes gateway restart`, re-check status.
+
+`<merged-ref>` is the pasture branch and `<pristine-ref>` the upstream tag.
+
+```bash
+# 3. pre-warm pm's uv cache. EXTRAS_FILE = one line of space-separated extras, the same list
+#    hermes-promote.sh computes in its "extras" step from the live venv/ (2026-10-18: the 22 below).
+L=~/.local/state/hermes-promote
+echo 'all acp anthropic audio-io bedrock computer-use discord doc-extract edge-tts exa firecrawl google stt-whisper telegram trace-upload vertex vision wake-porcupine wake-sherpa web wecom youtube' > $L/extras.txt
+$L/prewarm.sh $L/extras.txt > $L/prewarm.log 2>&1; echo "rc=$?" > $L/prewarm.rc    # background; 16 min on 2026-10-18
+```
+
+`prewarm.sh` runs `pm install` for the **pasture** (its own install key) with those extras, retrying
+(up to 24 times, 30 s apart): pm's `uv sync` gives up after 1800 s but finished wheels stay in
+`~/.hermes/cache/uv`. It ends `PREWARM-OK try N` and `rc=0`; `promote-run.sh` refuses to run unless
+`prewarm.rc` is exactly `rc=0`. Re-run it if the pasture's `pyproject.toml`/`uv.lock` change after
+the pre-warm (inferred, not tested). The list above is the 2026-10-18 one; `prewarm.log` does not
+record how that run passed it, so recompute it if `venv/` gained packages (UNVERIFIED).
+
+### The window
+
+```bash
+# 4. move the previous attempt's log/rc aside (a stale promote-run.rc fools a waiter), then run it IN THE BACKGROUND
+~/ops/site-private/bin/bg $L/promote-run.sh "$TARGET" > $L/promote-run.log 2>&1; echo "rc=$?" > $L/promote-run.rc
+```
+
+Wait on `promote-run.rc`, not on a pipe or a process pattern; read the log for `PROMOTE-OK in N s`,
+`ROLLED-BACK` or `PROMOTE-FAIL`. Exit codes: 0 promoted; 2 refused in preflight (nothing was
+touched); 3 rolled back, old gateway restarted (`OLD GATEWAY NOT UP: needs djbclark` in the log means
+start it by hand, see Rollback). What `promote-run.sh` does, in order:
+
+- **preflight**: live tree clean, live HEAD = rollback point, pasture HEAD = `$TARGET`, `prewarm.rc` = `rc=0`.
+- **stop jobs** with `out()`: gateway, then dashboard (writers of state.db first), then memory-journal.
+- **`hermes-promote.sh`** (`set -euo pipefail`; any failure rolls back), phases:
+   - (a) preflight (tracked tree clean, `$BK` absent, store Python present, `git fetch` of the pasture branch, `$TARGET` is a fast-forward);
+   - (b) **backups into `$BK` = `~/.local/state/hermes-promote/v0.22.2-<date>-<hhmm>`**: `cp -c -R` APFS clone of the whole checkout to `checkout.pre/` (the only copy of the old `venv/`, `.venv/`, `web_dist`, `node_modules`, desktop build), `sqlite3 state.db ".backup"`, `config.yaml`, `bin/{hermes,hermes-acp,hermes-agent}`, `HEAD`, `skills.bundled_manifest`, md5s;
+   - (c) `git merge --ff-only $TARGET`;
+   - (d) extras the live `venv/` carries (restricted to `venv/`, not the stale `.venv/`) → `extras.txt`;
+   - (e) `pm install --extra …` with the store Python (`env -u PYTHONPATH -u PYTHONHOME -u VIRTUAL_ENV $PY -m pm.cli install`);
+   - (f) first launch through the old shim (`~/.local/bin/hermes config check`): adopts `install-stamp.json`, publishes `.hermes/bin/{hermes,hermes-acp}`, rewrites the 3 launchers, migrates config 34 → 50;
+   - (g) completion tail (`source_completion.py --finish-update`): Node deps, TUI + web builds, model-catalog seed, bundled-skills sync, final stamp;
+   - (h) removes the lefthook `pre-commit` hook v0.22.2's `prepare` installs into the shared `.git` (it would change commit behaviour for every fork worktree and needs `ruff`/`npx`), unless the backup clone had one;
+   - (i) opens `SessionDB()` once with the new environment's Python: state.db 30 → 31 under watch instead of inside the gateway's first start;
+   - (j) `hermes --version`, `hermes config check` (written to a file then grepped: piping into `grep -m1` raised BrokenPipe under `pipefail` in the rehearsal).
+- **go/no-go**: `--version` has `v0.22.2` and `Python: 3.14`; `Config version: 50`; `hermes pm status` rc 0; the shim names `$C/.hermes/bin/hermes`; no lefthook hook; `GATEWAY_FORK_DIR=$C SKIP_LAUNCHCTL=1` fork-invariants script passes. Any NO-GO → rollback.
+- **start gateway** (`boot()`), wait up to 240 s for `Gateway running with` in the log past the pre-start byte offset (else rollback), then `hermes gateway status`.
+- **dashboard, bridge, memory-journal**: dashboard `boot()`, `launchctl kickstart -k` the MCP bridge, then install the repo's `cron/com.djbclark.hermes-memory-journal.plist` over the LaunchAgent (the original is saved as `$BK/memory-journal.plist.orig`; the repo copy runs `.hermes/bin/hermes --run-module cron.scripts.memory_journal_consumer`) and `boot()` it; prints the dashboard HTTP code and job states.
+- **push**: `git push origin main` (not fatal if it fails; retry by hand, never a bare `git push`, §0). The pasture branch push is NOT in the driver: `git -C "$P" push origin chore/upstream-merge-2026-10`.
+
+Timings of the real run (attempt 3, 20:19:21 → `PROMOTE-OK in 511 s`; the gateway was down from
+20:19:2x to 20:27:26, about 8 min; the rehearsal numbers are in brackets):
+
+| step | real | |
+|---|---|---|
+| stop jobs | 6 s | |
+| backups | 89 s | [45 s] |
+| fast-forward | 6 s | [4 s] |
+| `pm install` | 20 s | [123 s warm cache, 353 s cold cache under load] |
+| first launch | **280 s** | [24 s]: it also finished the "interrupted source update": TUI, web **and the packaged desktop app** (`hermes_cli/source_build.py` includes `apps/desktop` whenever a packaged desktop app exists; the rehearsal sandbox had none) |
+| completion tail | 53 s | [93–128 s] |
+| state.db 30 → 31 + checks + go/no-go | 8 s | [6 s for the migration] |
+| gateway to "Gateway running with 2 platform(s)" | 24 s | |
+| dashboard, bridge, memory-journal, push | 28 s | |
+
+No way to defer the first launch's desktop build was tried. If the 4-5 min matters, test one on a
+scratch copy first.
+
+### After the driver says PROMOTE-OK
+
+```bash
+# 5. verify by eye (the driver already did the checks; these are the ones it cannot judge)
+hermes --version            # "Hermes Agent v0.22.2+…", "Python: 3.14.7"
+hermes gateway status       # "Supervised by launchd job com.stayturgid.hermes-gateway"
+tail -60 ~/.hermes/logs/gateway.log     # Discord/Telegram connected, "Gateway running with 2 platform(s)", no plugin ImportError
+grep -n shutdown_watchdog ~/.hermes/logs/gateway.log | tail -3    # quiet
+curl -sI http://100.113.53.87:9119/ | head -1    # 2026-10-18: 302 (a redirect), not the 200 the rehearsal saw
+launchctl print $U/com.djbclark.hermes-memory-journal | rg 'last exit|state'    # last exit code = 0
+```
+
+Seen in the 2026-10-18 gateway log and not judged: `Signal: cannot reach signal-cli at
+http://127.0.0.1:18765` (ERROR) and `sms: TWILIO_PHONE_NUMBER not set` (warning). The gateway still
+reached "Gateway running with 2 platform(s)"; whether the Signal error predates the promotion is
+UNVERIFIED. The skill curator's LLM call with model `big-pickle` (`stayturgid_hermes_model`) failed
+with HTTP 400 in the scratch rehearsal; live it is the same, and older: `skills/.curator_state` still
+records `last_run_at: 2026-10-13`, `llm: Model 'big-pickle' isn't available on custom … invalid model
+format. Expected format: modelType/model`. The live `model:` block is now `provider: xai-oauth` /
+`default: grok-4.7` (2026-10-18), so the curator is passing a model that no longer matches the
+provider; its next real run is the test of whether it picks the config default up.
+
+```bash
+# 6. push the pasture branch (the driver pushes only main)
+git -C "$P" push origin chore/upstream-merge-2026-10
+```
+
+Then soak for a day (§7). The gateway and dashboard plists are unchanged: they exec
+`~/.local/bin/hermes`, which now execs `$C/.hermes/bin/hermes`.
+
+### Rollback (verified twice, plus the two live rollbacks of 2026-10-18)
+
+The driver rolls back by itself when anything before "Gateway running" fails. By hand, from a plain
+shell, with `BK` = the backup directory (its path is printed at the end of `promote-run.log`, and
+`ls -d ~/.local/state/hermes-promote/v0.22.2-*`):
+
+```bash
+U=gui/$(id -u); BK=~/.local/state/hermes-promote/v0.22.2-<date>-<hhmm>
+# bootout returns early: wait for the unload AND the pid to exit (same logic as out() in promote-run.sh)
+for j in com.stayturgid.hermes-gateway com.djbclark.hermes-dashboard com.djbclark.hermes-memory-journal; do
+  pid=$(launchctl print $U/$j 2>/dev/null | awk '$1=="pid"{print $3; exit}')
+  launchctl bootout $U/$j 2>/dev/null
+  while launchctl print $U/$j >/dev/null 2>&1 || { [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; }; do sleep 1; done
+done
+bash ~/.local/state/bigteam/adhoc-2026-10-18/hm-promo-rehearsal/bin-tools/hermes-rollback.sh "$BK"
+#   RESTORE_DATA=1 bash …/hermes-rollback.sh "$BK"   # only if state.db/config are damaged: loses post-promotion history
+hermes --version            # "Hermes Agent v0.21.5 (2026.9.24) · upstream 09750eb5", "Python: 3.11.15"
+cp -p $BK/memory-journal.plist.orig ~/Library/LaunchAgents/com.djbclark.hermes-memory-journal.plist   # only if the driver had already swapped it
+launchctl bootstrap $U ~/Library/LaunchAgents/com.stayturgid.hermes-gateway.plist
+launchctl bootstrap $U ~/Library/LaunchAgents/com.djbclark.hermes-dashboard.plist
+launchctl kickstart -k $U/com.djbclark.hermes-mcp-bridge     # what the driver's own rollback does last
+```
+
+(The wait loop is `out()` simplified and was not run as written; the `launchctl` calls and
+`hermes-rollback.sh` are the verified ones.) `hermes-rollback.sh BK [SHA]` does, in order:
+
+1. `git reset --keep <HEAD from $BK/HEAD>` in place: refs, branches and worktree metadata made since the promotion are kept (swapping the whole checkout directory back would drop commits that worktree agents made meanwhile);
+2. restores the gitignored runtime artifacts from `checkout.pre/` by APFS clone (`venv`, `.venv`, `node_modules`, `web/node_modules`, `ui-tui/node_modules`, `hermes_cli/web_dist`, `ui-tui/dist`, `apps/desktop/{dist,release}`), removing any the promotion created;
+3. removes `install-stamp.json`, `.hermes/bin/{hermes,hermes-acp}` and the lefthook hook;
+4. restores the 3 `~/.local/bin` launchers (temp file, then `mv -f`);
+5. **keeps** state.db (schema 31) and config.yaml (v50) by default: v0.21.5 opens, writes and reads a v31 state.db and accepts a v50 config (34 → 50 changed only `_config_version`), so nothing written since the promotion is lost. `RESTORE_DATA=1` puts the backups back instead. `installs/` is left in place (inert for the old code).
+
+Evidence: restore-data run 97 s (schema 30, `config.yaml` md5 = live's); keep-data run 115 s (v0.21.5 /
+3.11.15, launchers byte-identical to the backups, `hermes-acp` runs, 998 sessions, the session
+written by the promoted copy survived); old code on the v31 DB creates sessions and appends
+messages; old code on the v50 config prints `Config version: 50 ✓`. The two live rollbacks
+(attempts 1 and 2) both ended on v0.21.5 / 3.11.15.
+
+Not undone by the rollback (harmless): `installs/<key>` (~0.7 GB; `rm -rf` it after giving up on
+the target), the 2 bundled skills synced to the new content (`git -C ~/.hermes checkout --
+skills/media/youtube-content skills/software-development/hermes-agent-skill-authoring` if wanted),
+and `skills/.curator_state`.
+
+### After the soak: the desktop app
+
+Rebuild with the gateway running, never in the downtime window. The command is UNVERIFIED as a
+desktop-only run: `hermes_cli/source_completion.py` takes `--desktop` (read in source), so
+`(cd $C && env -u PYTHONPATH -u PYTHONHOME -u VIRTUAL_ENV $PY -I -B -u hermes_cli/source_completion.py --source $C --finish-update --desktop)`
+with `PY` = the store Python (`ls -d ~/.hermes/tools/python-3.14.*/bin/python3 | tail -1`)
+should do it. Do not swap the running desktop app out from under the operator; leave that to them
+(`~/.hermes/skills/hermes/hermes-install-lifecycle/SKILL.md`: the installed app is packaged, so
+editing `apps/desktop/src` changes nothing until it is rebuilt, and the running app is theirs to swap).
+
+The pre-v0.22.2 procedure (`uv pip install -e '.[all]' --python venv/bin/python`, then
+`hermes gateway restart`) was removed on 2026-10-19: it cannot install v0.22.2+ into the 3.11
+`venv/`, `check-hindsight-hook-invariants.sh` is deleted, and a rollback to an older tag is
+`hermes-rollback.sh` (it restores `venv/` from the backup clone). It is in git history at
+`a6b187d8a6`.
 
 ## 7. Afterwards
 
-- Handoff: `docs/handoffs/HANDOFF_standalone-bd7d_upstream-merge-<phase>_<date>_<4hex>.md`
-  (same frontmatter schema; parent = previous handoff id).
-- `~/.hermes/scripts/check-gateway-fork-invariants.sh`: update symbol/file checks if a fork helper
-  moved (2026-09: update restart moved to `update_cmd_fleet.py`); commit only that file in `~/.hermes`.
-  2026-10-18: its check 2b still greps `hermes_cli/gateway.py` for the install guard, which has lived
-  in `hermes_cli/gateway_launchd.py` since the v2026.9.24 split, so it already fails on live `main`.
-- `~/.hermes/skills/hermes/hermes-install-lifecycle/SKILL.md` points here.
-- After a day's soak: `$W remove upstream-merge-$YM` (handles the immutable-flag files; `--force` if
-  it is dirty), then `git branch -d` the merged local branches. Do NOT bulk-delete other local
-  branches: several `fix/*`/`feat/*` branches hold commits that are not in `main` (list them with
-  `git rev-list --count main..<branch>`); review before pruning.
-- Watch the gateway log for a day (tolerant MCP list: a dropped-tool warning, not a dead server).
+1. **Handoff + conflict map:** `docs/handoffs/HANDOFF_standalone-bd7d_upstream-merge-<phase>_<date>_<4hex>.md`
+   (same frontmatter schema; parent = previous handoff id) and
+   `docs/UPSTREAM_MERGE_CONFLICT_MAP_<date>_<tag>.md`, both committed.
+2. **Soak a day.** Watch `~/.hermes/logs/gateway.log` (tolerant MCP list: a dropped-tool warning, not
+   a dead server), then do the cleanups below.
+3. **Keep the old `venv/` until every old-venv consumer is migrated** — which, as of 2026-10-19, is
+   not possible for most of them. They keep working only because `venv/` stays and the new code still
+   imports on 3.11. Find them with
+   `rg -l 'hermes-agent/(\.)?venv' ~/.hermes/scripts ~/Library/LaunchAgents`.
+   **`--run-module` takes a dotted module name only** (the launcher does
+   `runpy.run_module`): no script path, no `-c`, no stdin. So only a consumer that runs a module
+   inside the checkout, or the `hermes` CLI itself, can move. On 2026-10-19 (`~/.hermes` commit
+   `f92bb42`) that was two: `scripts/memory-journal-consumer.sh` (now
+   `.hermes/bin/hermes --run-module cron.scripts.memory_journal_consumer`, the same form as
+   `cron/com.djbclark.hermes-memory-journal.plist`) and `scripts/ai-frontier-weekly-research.sh`
+   (a plain CLI call: `.hermes/bin/hermes -z …` / `send`). Still on `venv/bin/python`, each because it
+   runs a file by path or a stdin heredoc: `scripts/{memory-metrics-report,memory-size-watchdog,
+   tcc-audit-watchdog,gmail-index-sync,provider-health-watchdog}.sh`, plus the `xai-oauth-bridge`
+   LaunchAgent (`~/ops/site-djbclark/roles/litellm/defaults/main.yml`
+   `litellm_xai_bridge_python`; its script imports `hermes_cli.auth`, and the pm env's venv path
+   contains a per-sync uuid, so there is no stable interpreter path to point it at — change the
+   Ansible role, never the live plist). The Hermes cron job `8486ce778b40` (Provider Health Watchdog)
+   is disabled; only its `last_error` names the path. Each of those needs either a module shipped
+   inside the checkout (the `cron.scripts.*` route) or a stdlib-only interpreter
+   (`tcc-audit-watchdog.sh` and `gmail-index-sync.sh` import stdlib only and already fall back to
+   `/usr/bin/python3`). Delete `venv/` and `.venv/` only once none is left.
+4. **`hermes pm gc`** reclaims what nothing references: unreferenced store entries, dependency and
+   runtime generations, and the `installs/<key>` state of **deleted** checkouts (`pm/cli.py` `cmd_gc`;
+   read, not run). `~/.hermes/installs/` held 4 borrowed environments from Oct 8 worktree test runs
+   (2.8 GiB: `38818021…`, `6246458f…` = `~/src/hermes-worktrees/fix-config-bigint`, `68ac85a5…`,
+   `c7de12bd…`) plus the merge pasture's own key; they only go once their worktree/pasture is removed
+   (item 7). Never `rm -rf` the live checkout's own `installs/<key>`.
+   **Measured 2026-10-19: `hermes pm gc` freed nothing** (`gc: removed 0, kept 9; removed 0
+   dependency generations, 0 PM runtime generations, 0 install state dir(s) of deleted checkouts`),
+   although three of those five borrowed keys (2.1 GiB) hash to directories that no longer exist —
+   `collect_orphan_install_states` evidently judges orphanhood by something else. It has no
+   `--dry-run`: to see what it would touch, hash the candidate checkouts yourself
+   (`sha256(realpath)[:16]` = the `installs/` key, `pm/environments.py` `install_key`) before
+   running it. Removing a borrowed `installs/<key>` by hand is the operator's call.
+5. **Re-check the fork-invariant script** `~/.hermes/scripts/check-gateway-fork-invariants.sh`:
+   update symbol/file checks if a fork helper moved (2026-09: update restart moved to
+   `update_cmd_fleet.py`; check 2b now greps `gateway_launchd.py`, fixed in `~/.hermes` commit
+   `0aaffdd`); commit only that file in `~/.hermes`. Run it with `GATEWAY_FORK_DIR=$C SKIP_LAUNCHCTL=1`;
+   on 2026-10-19 it passed against the live checkout. Check 6 now asserts the whole shim line
+   (`exec <checkout>/.hermes/bin/hermes "$@"`, override `HERMES_BIN_TARGET`) instead of the
+   substring "hermes-agent", and a new check 7 greps three fork-only tags an upstream merge could
+   drop silently (`FORK(launchctl-guard)`, exactly one `def _spawn_typescript(`,
+   `FORK(opencode-zen-keyless)`) — `~/.hermes` commit `01de18c`. The
+   old hindsight invariants script and its pytest line no longer apply.
+6. **Optional: `hermes sessions optimize-storage`** (v0.22.2 advises it: ~0.9 GB of the 1.6 GB
+   state.db). Run it after the soak, in the foreground, **with the gateway/dashboard/cron writers
+   stopped** (it refuses while the store is held unless `--force`; wait out the `bootout` as in the
+   rollback block), with free disk ≈ the DB size (`--no-vacuum` skips the VACUUM and the headroom).
+   It prints a progress bar and is safe to Ctrl-C and re-run. Back up `state.db` first.
+7. **Remove the merge pastures** after the soak: `$W remove upstream-merge-$YM` and the pristine one
+   (handles the immutable-flag files; `--force` if it is dirty), then `git branch -d` the merged local
+   branches. Do NOT bulk-delete other local branches: several `fix/*`/`feat/*` branches hold commits
+   that are not in `main` (`git rev-list --count main..<branch>`); review before pruning.
+8. **Backups:** `~/.local/state/hermes-promote/v0.22.2-*` hold the only restorable old `venv/` and
+   the pre-promotion `state.db` (1.6 GB each; `du` counts APFS-shared blocks, judge with `df`).
+   Remove them, and the failed-attempt directory, only when the promotion is accepted.
+9. `~/.hermes/skills/hermes/hermes-install-lifecycle/SKILL.md` points here.
 
 ## 8. Disk notes (measured 2026-09-21)
 

@@ -113,8 +113,9 @@ versus the same files at `v0.22.2` except the intentional `MemoryStore` rebind a
 - **`pm/` owns Hermes environments (new).** The runtime venv moved to
   `$HERMES_HOME/installs/<sha16(checkout)>/environments/<uuid>/venv` on a PM store Python 3.14; every runtime
   dependency is gated `python_version >= '3.14'`; `hermes_cli/update_cmd_deps.py` was deleted
-  (`old_updater_deps.py` stubs call `stop_for_relaunch()`). The playbook §6 promotion recipe is obsolete;
-  see the playbook's §6 rewrite note and the handoff.
+  (`old_updater_deps.py` stubs call `stop_for_relaunch()`). The pre-v0.22.2 playbook §6 promotion recipe
+  no longer works; §6 was rewritten for the pm runtime on 2026-10-19 from the rehearsal and the real
+  promotion — see playbook §6 and the handoff.
 - State DB schema 30 → 31 (auto, forward-only); config `_config_version` default 46 → 50.
 - New update modules (`update_cmd_check/commit/validation/pause_gate/...`, `update_finish`, `update_stage`,
   `update_completion`, `venv_sync`, `source_completion`), new gateway modules (`run_inbound_consumer`,
