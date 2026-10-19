@@ -413,6 +413,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             session_id: sessionId,
             command: command.replace(/^\/+/, '')
           }
+
           const result = ctx.timeoutMs
             ? await requestGateway<unknown>('slash.exec', payload, ctx.timeoutMs)
             : await requestGateway<unknown>('slash.exec', payload)
@@ -1376,6 +1377,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
         }
 
         const surface = resolveDesktopCommand(`/${name}`)?.surface
+
         const ctx: SlashActionCtx = {
           arg,
           command,

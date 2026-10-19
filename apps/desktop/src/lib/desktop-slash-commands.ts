@@ -164,6 +164,7 @@ export const AIUSE_SLASH_TIMEOUT_MS = 90_000
 
 const exec = (timeoutMs?: number): DesktopCommandSurface =>
   timeoutMs == null ? { kind: 'exec' } : { kind: 'exec', timeoutMs }
+
 const action = (id: DesktopActionId): DesktopCommandSurface => ({ kind: 'action', action: id })
 const picker = (id: DesktopPickerId): DesktopCommandSurface => ({ kind: 'picker', picker: id })
 const unavailable = (reason: DesktopUnavailableReason): DesktopCommandSurface => ({ kind: 'unavailable', reason })
