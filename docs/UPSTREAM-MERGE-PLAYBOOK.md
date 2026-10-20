@@ -533,13 +533,28 @@ The pre-v0.22.2 procedure (`uv pip install -e '.[all]' --python venv/bin/python`
    stopped** (it refuses while the store is held unless `--force`; wait out the `bootout` as in the
    rollback block), with free disk ≈ the DB size (`--no-vacuum` skips the VACUUM and the headroom).
    It prints a progress bar and is safe to Ctrl-C and re-run. Back up `state.db` first.
+   **Also stop `com.djbclark.hermes-mcp-bridge`** (2026-10-20): it spawns a `hermes mcp serve` child
+   that holds `state.db`/`-wal`/`-shm`, so with only gateway/dashboard/journal down the command still
+   refuses, naming that child's pid. `com.djbclark.hermes-mcp-auth` does not hold the store and can
+   stay up. Restart the bridge afterwards with
+   `launchctl kickstart -k gui/$(id -u)/com.djbclark.hermes-mcp-bridge`; any Claude session using the
+   `hermes` MCP tools loses them until it reconnects. Never reach for `--force`: the refusal is the
+   feature, and it names the holder.
+   **It asks `Proceed? [y/N]` and a non-interactive run answers itself:** with no TTY it prints
+   `Cancelled.` and exits **0**, so a backgrounded or piped invocation looks like a success that
+   reclaimed nothing. Feed it `printf 'y\n' |` and check the size afterwards, not just the status.
 7. **Remove the merge pastures** after the soak: `$W remove upstream-merge-$YM` and the pristine one
    (handles the immutable-flag files; `--force` if it is dirty), then `git branch -d` the merged local
    branches. Do NOT bulk-delete other local branches: several `fix/*`/`feat/*` branches hold commits
    that are not in `main` (`git rev-list --count main..<branch>`); review before pruning.
-8. **Backups:** `~/.local/state/hermes-promote/v0.22.2-*` hold the only restorable old `venv/` and
-   the pre-promotion `state.db` (1.6 GB each; `du` counts APFS-shared blocks, judge with `df`).
-   Remove them, and the failed-attempt directory, only when the promotion is accepted.
+8. **Backups: gone.** djbclark accepted the v0.22.2 promotion on 2026-10-20 and
+   `~/.local/state/hermes-promote/v0.22.2-20261018-{1921,2019}` were removed (6.9 GB *each*, 13.8 GB
+   together — `du` counts APFS-shared blocks, judge with `df`). There is no longer a restorable 3.11
+   `venv/` or a pre-promotion `state.db`. The small provenance files from both (both `config.yaml`s,
+   the go/no-go logs, `md5.before`, `HEAD`, the bundled-skill manifests, `memory-journal.plist.orig`)
+   are kept in `~/.local/state/hermes-promote/v0.22.2-20261018-metadata.tar.gz` (10 KB). For the next
+   promotion the rule stands: remove the backups, and the failed-attempt directory, only once the
+   promotion is accepted.
 9. `~/.hermes/skills/hermes/hermes-install-lifecycle/SKILL.md` points here.
 
 ## 8. Disk notes (measured 2026-09-21)
