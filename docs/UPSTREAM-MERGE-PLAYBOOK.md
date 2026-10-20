@@ -540,9 +540,13 @@ The pre-v0.22.2 procedure (`uv pip install -e '.[all]' --python venv/bin/python`
    `launchctl kickstart -k gui/$(id -u)/com.djbclark.hermes-mcp-bridge`; any Claude session using the
    `hermes` MCP tools loses them until it reconnects. Never reach for `--force`: the refusal is the
    feature, and it names the holder.
-   **It asks `Proceed? [y/N]` and a non-interactive run answers itself:** with no TTY it prints
-   `Cancelled.` and exits **0**, so a backgrounded or piped invocation looks like a success that
-   reclaimed nothing. Feed it `printf 'y\n' |` and check the size afterwards, not just the status.
+   **Pass `--yes`.** It asks `Proceed? [y/N]` for the disk-space confirmation, and with no TTY
+   `input()` raises EOFError, which it reads as "no": it prints `Cancelled.` and exits **0**. A
+   backgrounded or piped invocation therefore looks like a success that reclaimed nothing (2026-10-20:
+   it cost a whole attempt). `--yes` / `-y` is the supported way past that prompt; do not pipe
+   `printf 'y\n' |` into it. Judge the result by the before/after size, never by the exit status —
+   upstream NousResearch/hermes-agent#123322 tracks the wider family of `hermes sessions` failure
+   paths that return 0, and the no-TTY cancel is a sibling of those.
 7. **Remove the merge pastures** after the soak: `$W remove upstream-merge-$YM` and the pristine one
    (handles the immutable-flag files; `--force` if it is dirty), then `git branch -d` the merged local
    branches. Do NOT bulk-delete other local branches: several `fix/*`/`feat/*` branches hold commits
