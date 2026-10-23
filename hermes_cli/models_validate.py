@@ -811,6 +811,10 @@ _LADDER: tuple[tuple[Callable[[_Request], bool], Callable[[_Request], Optional[d
 )
 
 
+# Bound on a ``key_cmd`` mint for the model-listing probe: the user is waiting on ``/model``.
+_PROBE_MINT_TIMEOUT_SECONDS = 8.0
+
+
 def validate_requested_model(
     model_name: str,
     provider: Optional[str],
@@ -836,6 +840,13 @@ def validate_requested_model(
 
     if not requested:
         return _reject("Model name cannot be empty.")
+    if callable(api_key):
+        # A ``key_cmd`` / token-provider credential reaches the probes as a callable, which they would
+        # stringify into the Authorization header (``Bearer <... object at 0x...>``). Validation runs only
+        # for an explicit model switch, so mint here, bounded; the probe URLs are the endpoint's own origin
+        # and cross-origin redirects drop credentials. A mint failure yields "": today's soft-accept.
+        from agent.command_token_source import materialize_probe_api_key
+        api_key = materialize_probe_api_key(api_key, timeout=_PROBE_MINT_TIMEOUT_SECONDS)
     req = _Request(requested, lookup, provider, normalized, api_key, base_url, api_mode, headers)
     for gate, branch in _LADDER:
         if gate(req):
