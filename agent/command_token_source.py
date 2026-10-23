@@ -36,16 +36,20 @@ class CommandTokenError(RuntimeError):
     """A ``key_cmd`` failed to produce a usable token."""
 
 
-def materialize_probe_api_key(api_key: object) -> str:
-    """Best-effort probe credential; never send a callable's repr or log mint errors."""
+def materialize_probe_api_key(api_key: object, timeout: Optional[float] = None) -> str:
+    """Best-effort probe credential; never send a callable's repr or log mint errors. *timeout*
+    bounds a ``key_cmd`` mint (default: the request-path ceiling)."""
     try:
-        token = api_key() if callable(api_key) else api_key
+        if timeout is not None and isinstance(api_key, CommandTokenSource):
+            token = api_key(timeout=timeout)
+        else:
+            token = api_key() if callable(api_key) else api_key
     except Exception:
         return ""
     return token.strip() if isinstance(token, str) else ""
 
 
-def _mint(command: str, label: str) -> tuple[str, Optional[float]]:
+def _mint(command: str, label: str, timeout: float = _MINT_TIMEOUT_SECONDS) -> tuple[str, Optional[float]]:
     """Run *command*, returning ``(token, ttl_seconds_or_None)``. The helper runs FOR the profile whose
     provider is being minted: it gets that profile's own env (secrets + HERMES_HOME), never the multiplexer's
     launch environ — an ``op read`` / ``vault kv get`` helper must sign in as the served profile."""
@@ -53,13 +57,13 @@ def _mint(command: str, label: str) -> tuple[str, Optional[float]]:
 
     try:
         completed = subprocess.run(
-            command, stdin=subprocess.DEVNULL, shell=True, capture_output=True, text=True, errors="replace", timeout=_MINT_TIMEOUT_SECONDS,
+            command, stdin=subprocess.DEVNULL, shell=True, capture_output=True, text=True, errors="replace", timeout=timeout,
             env=served_profile_child_env(inherit_credentials=True),
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
         raise CommandTokenError(
-            f"key_cmd for provider {label!r} timed out after {_MINT_TIMEOUT_SECONDS}s"
+            f"key_cmd for provider {label!r} timed out after {timeout:g}s"
         ) from exc
     except OSError as exc:
         raise CommandTokenError(f"key_cmd for provider {label!r} could not be executed: {exc}") from exc
@@ -131,11 +135,12 @@ class CommandTokenSource:
         """Stable catalog identity; token rotation must not mint on cache reads."""
         return f"cmd:{self._command}"
 
-    def __call__(self) -> str:
+    def __call__(self, *, timeout: Optional[float] = None) -> str:
         with self._lock:
             if self._token and time.monotonic() < self._expires_at:
                 return self._token
-            token, ttl = _mint(self._command, self._label)
+            token, ttl = (_mint(self._command, self._label) if timeout is None
+                          else _mint(self._command, self._label, timeout))
             self._token = token
             self._expires_at = time.monotonic() + (
                 max(ttl - _TOKEN_REFRESH_LEEWAY_SECONDS, 5.0) if ttl else _NO_TTL_REFRESH_SECONDS
