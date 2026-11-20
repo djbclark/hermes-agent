@@ -1,3 +1,5 @@
+import base64
+import json
 import sys
 import types
 from types import SimpleNamespace
@@ -129,6 +131,21 @@ def _codex_message_response(text: str):
         status="completed",
         model="gpt-5-codex",
     )
+
+
+def _oauth_jwt(*, subject: str, account_id: str, token_id: str = "initial") -> str:
+    def _segment(value):
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+
+    return ".".join((
+        _segment({"alg": "none"}),
+        _segment({
+            "sub": subject,
+            "jti": token_id,
+            "https://api.openai.com/auth": {"chatgpt_account_id": account_id},
+        }),
+        "signature",
+    ))
 
 
 def _codex_tool_call_response():
@@ -1447,6 +1464,7 @@ def test_try_refresh_codex_client_credentials_handles_xai_oauth(monkeypatch):
     xai-oauth (both speak codex_responses) — covering both cases prevents
     silent regressions where the function gets gated to a single provider."""
     agent = _build_xai_oauth_agent(monkeypatch)
+    agent.api_key = _oauth_jwt(subject="xai-user", account_id="xai-account")
     closed = {"value": False}
     rebuilt = {"kwargs": None}
 
@@ -1457,6 +1475,8 @@ def test_try_refresh_codex_client_credentials_handles_xai_oauth(monkeypatch):
     class _RebuiltClient:
         pass
 
+    renewed = _oauth_jwt(subject="xai-user", account_id="xai-account", token_id="renewed")
+
     def _fake_openai(**kwargs):
         rebuilt["kwargs"] = kwargs
         return _RebuiltClient()
@@ -1466,7 +1486,7 @@ def test_try_refresh_codex_client_credentials_handles_xai_oauth(monkeypatch):
         # to verify that the agent's active key still matches; the actual
         # refresh later passes force_refresh=True.  Both calls must succeed.
         return {
-            "api_key": "fresh-xai-token" if force_refresh else agent.api_key,
+            "api_key": renewed if force_refresh else agent.api_key,
             "base_url": "https://api.x.ai/v1",
         }
 
@@ -1492,10 +1512,10 @@ def test_try_refresh_codex_client_credentials_handles_xai_oauth(monkeypatch):
     # vector) — it is retired (sockets shutdown, FD release via GC).
     assert closed["value"] is False
     assert retired["client"] is existing
-    assert rebuilt["kwargs"]["api_key"] == "fresh-xai-token"
+    assert rebuilt["kwargs"]["api_key"] == renewed
     assert rebuilt["kwargs"]["base_url"] == "https://api.x.ai/v1"
     assert isinstance(agent.client, _RebuiltClient)
-    assert agent.api_key == "fresh-xai-token"
+    assert agent.api_key == renewed
 
 
 def test_try_refresh_codex_client_credentials_skips_xai_oauth_when_singleton_differs(monkeypatch):
@@ -1546,6 +1566,108 @@ def test_try_refresh_codex_client_credentials_skips_xai_oauth_when_singleton_dif
         "agent that wasn't even using the singleton."
     )
     assert agent.api_key == pre_refresh_key
+
+
+@pytest.mark.parametrize("renewed_account, expected", [("account-a", True), ("account-b", False)])
+def test_codex_refresh_adopts_only_the_active_account(monkeypatch, renewed_account, expected):
+    agent = _build_agent(monkeypatch)
+    agent.provider = "openai-codex"
+    agent.api_mode = "codex_responses"
+    agent.api_key = _oauth_jwt(subject="user-a", account_id="account-a")
+    renewed = _oauth_jwt(
+        subject="user-a" if expected else "user-b",
+        account_id=renewed_account,
+        token_id="renewed",
+    )
+    refresh_calls = {"count": 0}
+
+    def _resolve(force_refresh=False, refresh_if_expiring=True, **_):
+        if force_refresh:
+            refresh_calls["count"] += 1
+        return {"api_key": renewed, "base_url": "https://chatgpt.com/backend-api/codex"}
+
+    monkeypatch.setattr("hermes_cli.auth.resolve_codex_runtime_credentials", _resolve)
+    monkeypatch.setattr(agent, "_adopt_openai_credentials", lambda *_args, **_kwargs: True)
+
+    assert agent._try_refresh_codex_client_credentials(force=True) is expected
+    assert refresh_calls["count"] == (1 if expected else 0)
+
+
+def test_codex_refresh_rejects_account_change_during_forced_refresh(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent.provider = "openai-codex"
+    agent.api_mode = "codex_responses"
+    active = _oauth_jwt(subject="user-a", account_id="account-a")
+    agent.api_key = active
+    replacement = _oauth_jwt(subject="user-b", account_id="account-b", token_id="renewed")
+
+    def _resolve(force_refresh=False, refresh_if_expiring=True, **_):
+        return {
+            "api_key": replacement if force_refresh else active,
+            "base_url": "https://chatgpt.com/backend-api/codex",
+        }
+
+    monkeypatch.setattr("hermes_cli.auth.resolve_codex_runtime_credentials", _resolve)
+    monkeypatch.setattr(agent, "_adopt_openai_credentials", lambda *_args, **_kwargs: pytest.fail("must reject"))
+
+    assert agent._try_refresh_codex_client_credentials(force=True) is False
+
+
+@pytest.mark.parametrize("singleton_key", ["opaque-active-token", ""])
+def test_codex_refresh_rejects_unknown_active_identity_even_when_singleton_matches(monkeypatch, singleton_key):
+    agent = _build_agent(monkeypatch)
+    agent.provider = "openai-codex"
+    agent.api_mode = "codex_responses"
+    agent.api_key = "opaque-active-token"
+    refresh_calls = {"count": 0}
+
+    def _resolve(force_refresh=False, refresh_if_expiring=True, **_):
+        if force_refresh:
+            refresh_calls["count"] += 1
+        return {"api_key": singleton_key, "base_url": "https://chatgpt.com/backend-api/codex"}
+
+    monkeypatch.setattr("hermes_cli.auth.resolve_codex_runtime_credentials", _resolve)
+
+    assert agent._try_refresh_codex_client_credentials(force=True) is False
+    assert refresh_calls["count"] == 0
+
+
+def test_codex_401_recovery_rebuilds_once_with_same_account_token(monkeypatch):
+    from agent.turn_recovery import _refresh_credentials_after_401
+    from agent.turn_retry_state import TurnRetryState
+
+    agent = _build_agent(monkeypatch)
+    agent.provider = "openai-codex"
+    agent.api_mode = "codex_responses"
+    active = _oauth_jwt(subject="user-a", account_id="account-a")
+    renewed = _oauth_jwt(subject="user-a", account_id="account-a", token_id="renewed")
+    agent.api_key = active
+    rebuilt = {"keys": []}
+
+    class _RebuiltClient:
+        pass
+
+    def _resolve(force_refresh=False, refresh_if_expiring=True, **_):
+        return {
+            "api_key": renewed if force_refresh else active,
+            "base_url": "https://chatgpt.com/backend-api/codex",
+        }
+
+    def _fake_openai(**kwargs):
+        rebuilt["keys"].append(kwargs["api_key"])
+        return _RebuiltClient()
+
+    monkeypatch.setattr("hermes_cli.auth.resolve_codex_runtime_credentials", _resolve)
+    monkeypatch.setattr("agent.process_bootstrap.OpenAI", _fake_openai)
+    monkeypatch.setattr(agent, "_retire_shared_openai_client", lambda *_args, **_kwargs: None)
+    retry = TurnRetryState()
+
+    assert _refresh_credentials_after_401(agent, RuntimeError("401 token_expired"), retry, 401) is True
+    assert rebuilt["keys"] == [renewed]
+    assert agent.api_key == renewed
+    assert retry.codex_auth_retry_attempted is True
+    assert _refresh_credentials_after_401(agent, RuntimeError("401 token_expired"), retry, 401) is False
+    assert rebuilt["keys"] == [renewed]
 
 
 def test_preflight_codex_api_kwargs_strips_optional_function_call_id(monkeypatch):
